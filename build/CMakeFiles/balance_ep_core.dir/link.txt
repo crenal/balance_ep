@@ -1,0 +1,2 @@
+/usr/bin/ar qc libbalance_ep_core.a CMakeFiles/balance_ep_core.dir/src/dispatch.cu.o
+/usr/bin/ranlib libbalance_ep_core.a
