@@ -157,14 +157,14 @@ CMakeFiles/balance_ep_core.dir/src/dispatch.cu.o : /workspace/balance_ep/src/dis
     /usr/include/c++/12/bits/utility.h \
     /usr/include/c++/12/initializer_list \
     /workspace/balance_ep/include/dispatch.h \
-    /workspace/nvshmem_install/include/nvshmem.h \
-    /workspace/nvshmem_install/include/non_abi/nvshmem_build_options.h \
-    /workspace/nvshmem_install/include/nvshmem_host.h \
-    /workspace/nvshmem_install/include/host/nvshmem_api.h \
     /usr/lib/gcc/x86_64-linux-gnu/12/include/stdint.h \
     /usr/include/stdint.h \
     /usr/include/x86_64-linux-gnu/bits/wchar.h \
     /usr/include/x86_64-linux-gnu/bits/stdint-uintn.h \
+    /workspace/nvshmem_install/include/nvshmem.h \
+    /workspace/nvshmem_install/include/non_abi/nvshmem_build_options.h \
+    /workspace/nvshmem_install/include/nvshmem_host.h \
+    /workspace/nvshmem_install/include/host/nvshmem_api.h \
     /usr/include/errno.h \
     /usr/include/x86_64-linux-gnu/bits/errno.h \
     /usr/include/linux/errno.h \
@@ -651,6 +651,10 @@ CMakeFiles/balance_ep_core.dir/src/dispatch.cu.o : /workspace/balance_ep/src/dis
     /workspace/nvshmem_install/include/device/nvshmemx_defines.h \
     /workspace/nvshmem_install/include/device/nvshmemx_collective_launch_apis.h \
     /workspace/nvshmem_install/include/device/nvshmemx_coll_defines.cuh \
+    /workspace/nvshmem_install/include/nvshmemx.h \
+    /workspace/nvshmem_install/include/device/tile/nvshmemx_tile_api.hpp \
+    /workspace/nvshmem_install/include/device/tile/nvshmemx_tile_api_defines.cuh \
+    /workspace/nvshmem_install/include/non_abi/device/pt-to-pt/tile.cuh \
     /usr/local/cuda/targets/x86_64-linux/include/cuda/std/__thread/threading_support_pthread.h \
     /usr/include/semaphore.h \
     /usr/include/x86_64-linux-gnu/bits/semaphore.h \

@@ -157,11 +157,11 @@ CMakeFiles/test_dispatch.dir/test/test_dispatch.cu.o : /workspace/balance_ep/tes
     /usr/include/c++/12/bits/utility.h \
     /usr/include/c++/12/initializer_list \
     /workspace/balance_ep/include/dispatch.h \
-    /usr/local/cuda/targets/x86_64-linux/include/cuda.h \
     /usr/lib/gcc/x86_64-linux-gnu/12/include/stdint.h \
     /usr/include/stdint.h \
     /usr/include/x86_64-linux-gnu/bits/wchar.h \
     /usr/include/x86_64-linux-gnu/bits/stdint-uintn.h \
+    /usr/local/cuda/targets/x86_64-linux/include/cuda.h \
     /workspace/nvshmem_install/include/nvshmem.h \
     /workspace/nvshmem_install/include/non_abi/nvshmem_build_options.h \
     /workspace/nvshmem_install/include/nvshmem_host.h \

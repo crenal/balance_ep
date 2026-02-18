@@ -1,2 +1,22 @@
 #!/usr/bin/env bash
-NVSHMEM_BOOTSTRAP=mpi NVSHMEM_BOOTSTRAP_LIBRARY=/workspace/nvshmem_install/lib/nvshmem_bootstrap_mpi.so /usr/local/openmpi/bin/mpirun --allow-run-as-root -np 4 ./build/test_dispatch
+# 可通过环境变量覆盖测试规模与拓扑参数
+# NUM_TOKENS_PER_RANK / EXPERT_NUM / HIDDEN_SIZE / TOPK / BLOCKS_PER_KERNEL
+# NNODES / RANKS_PER_NODE / NP
+NUM_TOKENS_PER_RANK=${NUM_TOKENS_PER_RANK:-8192}
+EXPERT_NUM=${EXPERT_NUM:-128}
+HIDDEN_SIZE=${HIDDEN_SIZE:-8192}
+TOPK=${TOPK:-8}
+BLOCKS_PER_KERNEL=${BLOCKS_PER_KERNEL:-8}
+NNODES=${NNODES:-2}
+RANKS_PER_NODE=${RANKS_PER_NODE:-4}
+NP=${NP:-8}
+
+NUM_TOKENS_PER_RANK=$NUM_TOKENS_PER_RANK \
+EXPERT_NUM=$EXPERT_NUM \
+HIDDEN_SIZE=$HIDDEN_SIZE \
+TOPK=$TOPK \
+BLOCKS_PER_KERNEL=$BLOCKS_PER_KERNEL \
+NVSHMEM_BOOTSTRAP=mpi \
+NVSHMEM_BOOTSTRAP_LIBRARY=/workspace/nvshmem_install/lib/nvshmem_bootstrap_mpi.so \
+/usr/local/openmpi/bin/mpirun --allow-run-as-root -np $NP \
+./build/test_dispatch --nnodes $NNODES --ranks_per_node $RANKS_PER_NODE
