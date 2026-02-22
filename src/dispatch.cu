@@ -180,7 +180,6 @@ static __device__ __forceinline__ void dispatch_stage1(
     }
     tile.sync();
     nvshmem_quiet();
-    tile.sync();
     if (nnodes > 1 && mid_buf && mid_flags && tile.thread_rank() == 0) {
       for (int dst_node = 0; dst_node < nnodes; ++dst_node) {
         if (dst_node == src_node) continue;
@@ -225,34 +224,10 @@ static __device__ __forceinline__ void dispatch_stage2(
       }
       tile.sync();
       nvshmem_quiet();
-      tile.sync();
       if (tile.thread_rank() == 0) {
         flag_ptr[0] = 0;
       }
     }
-  }
-}
-
-static __device__ __forceinline__ void dispatch_chunks(
-    const void *input_tokens, void *output_tokens, const IntranodeIndex *intranode_index,
-    int num_tokens, int hidden_size, int bytes_per_elem, int node_npes, int nnodes,
-    const void *mid_buf, uint64_t *mid_flags, int chunk_tokens_local, int num_chunks, int npes,
-    int mype, int src_node, int src_local, size_t token_bytes,
-    cg::thread_block_tile<128> tile) {
-  int tile_id = tile.meta_group_rank();
-  int tile_count = tile.meta_group_size();
-  bool stage1 = tile_id < (tile_count / 2);
-  if (stage1) {
-    dispatch_stage1(input_tokens, output_tokens, intranode_index, num_tokens, hidden_size,
-                    bytes_per_elem, node_npes, nnodes, mid_buf, mid_flags, chunk_tokens_local,
-                    num_chunks, npes, mype, src_node, src_local, token_bytes, tile);
-  }
-  else {
-    int node_id = mype / node_npes;
-    int local_rank = mype - node_id * node_npes;
-    dispatch_stage2(output_tokens, intranode_index, num_tokens, hidden_size, bytes_per_elem,
-                    node_npes, nnodes, mid_buf, mid_flags, chunk_tokens_local, num_chunks, npes,
-                    node_id, local_rank, token_bytes, tile);
   }
 }
 
@@ -273,9 +248,21 @@ __global__ void dispatch_kernel(const void *input_tokens, void *output_tokens,
   int num_chunks = (num_tokens + chunk_tokens_local - 1) / chunk_tokens_local;
   if (num_chunks <= 0) return;
   auto tile = cg::tiled_partition<128>(cg::this_thread_block());
-  dispatch_chunks(input_tokens, output_tokens, intranode_index, num_tokens, hidden_size,
-                  bytes_per_elem, node_npes, nnodes, mid_buf, mid_flags, chunk_tokens_local,
-                  num_chunks, npes, mype, src_node, src_local, token_bytes, tile);
+  int tile_id = tile.meta_group_rank();
+  int tile_count = tile.meta_group_size();
+  bool stage1 = tile_id < (tile_count / 2);
+  if (stage1) {
+    dispatch_stage1(input_tokens, output_tokens, intranode_index, num_tokens, hidden_size,
+                    bytes_per_elem, node_npes, nnodes, mid_buf, mid_flags, chunk_tokens_local,
+                    num_chunks, npes, mype, src_node, src_local, token_bytes, tile);
+  }
+  else {
+    int node_id = mype / node_npes;
+    int local_rank = mype - node_id * node_npes;
+    dispatch_stage2(output_tokens, intranode_index, num_tokens, hidden_size, bytes_per_elem,
+                    node_npes, nnodes, mid_buf, mid_flags, chunk_tokens_local, num_chunks, npes,
+                    node_id, local_rank, token_bytes, tile);
+  }
 }
 // host 侧入口：生成 intranode_index
 int pre_process(const bool *routing_map, IntranodeIndex *intranode_index, const DispatchConfig *cfg) {

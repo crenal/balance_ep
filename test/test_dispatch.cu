@@ -358,12 +358,18 @@ int main(int argc, char **argv) {
   int blocks_per_kernel = 8;
   // chunk_tokens 控制每个 chunk 的 token 数，影响 flag 数量与流水化程度
   int chunk_tokens = 256;
+  int bench_iters = 0;
+  int bench_warmup = 5;
+  int bench_only = 0;
   read_env_int("NUM_TOKENS_PER_RANK", &num_tokens_per_rank);
   read_env_int("EXPERT_NUM", &expert_num);
   read_env_int("HIDDEN_SIZE", &hidden_size);
   read_env_int("TOPK", &topk);
   read_env_int("BLOCKS_PER_KERNEL", &blocks_per_kernel);
   read_env_int("CHUNK_TOKENS", &chunk_tokens);
+  read_env_int("BENCH_ITERS", &bench_iters);
+  read_env_int("BENCH_WARMUP", &bench_warmup);
+  read_env_int("BENCH_ONLY", &bench_only);
   if (topk > expert_num) topk = expert_num;
   const int bytes_per_elem = (int)sizeof(float);
   size_t token_bytes = (size_t)hidden_size * (size_t)bytes_per_elem;
@@ -425,18 +431,46 @@ int main(int argc, char **argv) {
   }
   nvshmem_barrier_all();
 
-  // 校验输出与 flag 状态
-  int errors = (status != 0)
-                   ? 1
-                   : check_output(&buf, num_tokens_per_rank, hidden_size, npes, expert_num, mype);
-  if (errors == 0) {
-    errors = check_flags_cleared(&buf);
+  int errors = 0;
+  if (bench_iters > 0) {
+    size_t local_bytes =
+        (size_t)num_tokens_per_rank * (size_t)topk * (size_t)token_bytes;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    for (int i = 0; i < bench_warmup; ++i) {
+      dispatch_tokens(buf.input_tokens, buf.output_tokens, buf.intranode_index, &cfg);
+      nvshmem_barrier_all();
+    }
+    cudaEventRecord(start);
+    for (int i = 0; i < bench_iters; ++i) {
+      dispatch_tokens(buf.input_tokens, buf.output_tokens, buf.intranode_index, &cfg);
+      nvshmem_barrier_all();
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, start, stop);
+    double sec = ms / 1000.0;
+    double bw_gb = (double)local_bytes * (double)bench_iters / sec / 1e9;
+    printf("PE %d: avg_bw %.3f GB/s, iters %d\n", mype, bw_gb, bench_iters);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
   }
-  if (errors != 0) {
-    printf("PE %d: dispatch_tokens failed\n", mype);
-  }
-  else{
-    printf("PE %d: dispatch_tokens passed\n", mype);
+
+  if (!bench_only) {
+    errors = (status != 0)
+                 ? 1
+                 : check_output(&buf, num_tokens_per_rank, hidden_size, npes, expert_num, mype);
+    if (errors == 0) {
+      errors = check_flags_cleared(&buf);
+    }
+    if (errors != 0) {
+      printf("PE %d: dispatch_tokens failed\n", mype);
+    }
+    else{
+      printf("PE %d: dispatch_tokens passed\n", mype);
+    }
   }
   cudaFree(cfg.counts);
   cudaFree(cfg.offsets);
