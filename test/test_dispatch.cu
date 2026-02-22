@@ -23,7 +23,7 @@ struct TestBuffers {
   float *output_tokens;
   // 设备侧 routing_map 与 intranode_index
   bool *routing_map;
-  IntranodeIndex *intranode_index;
+  int *intranode_index;
   // 跨节点转发的中间缓冲及其 flag
   void *mid_buf;
   uint64_t *mid_flags;
@@ -45,7 +45,7 @@ static int allocate_buffers(TestBuffers *buf, size_t input_bytes, size_t output_
   buf->routing_map = nullptr;
   cudaMalloc((void **)&buf->routing_map, map_bytes);
   buf->intranode_index = nullptr;
-  cudaMalloc((void **)&buf->intranode_index, intranode_elems * sizeof(IntranodeIndex));
+  cudaMalloc((void **)&buf->intranode_index, intranode_elems * sizeof(int));
   // 每个 rank 分配 (nnodes-1) 块中转缓冲与 flag
   buf->mid_buf_bytes = (nnodes > 1) ? (size_t)(nnodes - 1) * input_bytes : 0;
   buf->mid_flags_bytes =

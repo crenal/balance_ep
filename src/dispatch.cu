@@ -41,7 +41,7 @@ __device__ __forceinline__ int node_block_index(int local_node, int remote_node)
 // 单次 kernel 分三阶段完成计数、前缀与索引构建
 // routing_map 维度为 [global_token][expert]，global_token = src_rank * num_tokens + local_token
 __global__ void preprocess_kernel(const bool *routing_map, int *counts, int *offsets,
-                                  IntranodeIndex *intranode_index, int *local_counts,
+                                  int *intranode_index, int *local_counts,
                                   int num_tokens, int expert_num, int node_npes, int blocks,
                                   int *barrier_counter, int *barrier_sense) {
   int npes = nvshmem_n_pes();
@@ -87,13 +87,11 @@ __global__ void preprocess_kernel(const bool *routing_map, int *counts, int *off
 
   grid_barrier(barrier_counter, barrier_sense, blocks);
 
-  // 阶段 3：为每个 global_token 计算其发往各目标 rank 的写入位置与路由类型
+// 阶段 3：为每个 global_token 计算其发往各目标 rank 的写入位置
   // intranode_index 以 global_token 为索引，保证跨节点转发时可被中继 rank 访问
   int experts_per_rank = (expert_num + npes - 1) / npes;
   for (int g = tid; g < global_tokens; g += stride) {
     int src = g / num_tokens;
-    int src_node = src / node_npes;
-    int src_local = src - src_node * node_npes;
     size_t base = (size_t)g * (size_t)expert_num;
     for (int j = 0; j < npes; ++j) {
       bool has = false;
@@ -108,32 +106,19 @@ __global__ void preprocess_kernel(const bool *routing_map, int *counts, int *off
           }
         }
       }
-      IntranodeIndex entry;
-      entry.target_rank = j;
       if (has) {
         int local = atomicAdd(&local_counts[src * npes + j], 1);
-        entry.index = offsets[src * npes + j] + local;
-        int dst_node = j / node_npes;
-        int dst_local = j - dst_node * node_npes;
-        // route 由节点与 local_rank 关系决定
-        if (src_node == dst_node) {
-          entry.route = 0;
-        } else if (src_local == dst_local) {
-          entry.route = 1;
-        } else {
-          entry.route = 2;
-        }
+        intranode_index[(size_t)g * (size_t)npes + (size_t)j] =
+            offsets[src * npes + j] + local;
       } else {
-        entry.index = -1;
-        entry.route = -1;
+        intranode_index[(size_t)g * (size_t)npes + (size_t)j] = -1;
       }
-      intranode_index[(size_t)g * (size_t)npes + (size_t)j] = entry;
     }
   }
 }
 
 static __device__ __forceinline__ void dispatch_stage1(
-    const void *input_tokens, void *output_tokens, const IntranodeIndex *intranode_index,
+    const void *input_tokens, void *output_tokens, const int *intranode_index,
     int num_tokens, int hidden_size, int bytes_per_elem, int node_npes, int nnodes,
     const void *mid_buf, uint64_t *mid_flags, int chunk_tokens_local, int num_chunks, int npes,
     int mype, int src_node, int src_local, size_t token_bytes,
@@ -145,96 +130,95 @@ static __device__ __forceinline__ void dispatch_stage1(
     for (int t = t_begin + tile.thread_rank(); t < t_end; t += tile.size()) {
       size_t src_offset = (size_t)t * token_bytes;
       size_t g = (size_t)mype * (size_t)num_tokens + (size_t)t;
-      for (int j = 0; j < npes; ++j) {
-        const IntranodeIndex entry = intranode_index[g * (size_t)npes + (size_t)j];
-        int idx = entry.index;
+      int node_base = src_node * node_npes;
+      for (int lr = 0; lr < node_npes; ++lr) {
+        int dst_rank = node_base + lr;
+        int idx = intranode_index[g * (size_t)npes + (size_t)dst_rank];
         if (idx < 0) continue;
-        if (entry.route == 0 || entry.route == 1) {
-          size_t dst_offset = (size_t)idx * token_bytes;
-          nvshmem_putmem((char *)output_tokens + dst_offset,
-                         (const char *)input_tokens + src_offset, token_bytes, j);
-        }
-      }
-      if (nnodes > 1 && mid_buf && mid_flags) {
-        for (int dst_node = 0; dst_node < nnodes; ++dst_node) {
-          if (dst_node == src_node) continue;
-          bool need_send = false;
-          for (int lr = 0; lr < node_npes; ++lr) {
-            int dst_rank = dst_node * node_npes + lr;
-            const IntranodeIndex entry =
-                intranode_index[g * (size_t)npes + (size_t)dst_rank];
-            if (entry.index >= 0 && entry.route == 2) {
-              need_send = true;
-              break;
-            }
-          }
-          if (!need_send) continue;
-          int node_idx = node_block_index(dst_node, src_node);
-          size_t mid_base = (size_t)node_idx * (size_t)num_tokens * token_bytes;
-          size_t mid_offset = mid_base + (size_t)t * token_bytes;
-          nvshmem_putmem((char *)mid_buf + mid_offset,
-                         (const char *)input_tokens + src_offset, token_bytes,
-                         dst_node * node_npes + src_local);
-        }
+        size_t dst_offset = (size_t)idx * token_bytes;
+        nvshmem_putmem((char *)output_tokens + dst_offset,
+                       (const char *)input_tokens + src_offset, token_bytes, dst_rank);
       }
     }
     tile.sync();
-    nvshmem_quiet();
-    if (nnodes > 1 && mid_buf && mid_flags && tile.thread_rank() == 0) {
-      for (int dst_node = 0; dst_node < nnodes; ++dst_node) {
-        if (dst_node == src_node) continue;
-        int node_idx = node_block_index(dst_node, src_node);
+    if (nnodes > 1 && mid_buf && mid_flags) {
+      for (int remote_node = 0; remote_node < nnodes; ++remote_node) {
+        if (remote_node == src_node) continue;
+        int node_idx = node_block_index(src_node, remote_node);
         uint64_t *flag_ptr = mid_flags + (size_t)node_idx * (size_t)num_chunks + chunk_id;
-        nvshmemx_signal_op(flag_ptr, 1ull, NVSHMEM_SIGNAL_SET,
-                           dst_node * node_npes + src_local);
+        nvshmem_signal_wait_until(flag_ptr, NVSHMEM_CMP_EQ, 1ull);
+        for (int t = t_begin + tile.thread_rank(); t < t_end; t += tile.size()) {
+          int src_rank = remote_node * node_npes + src_local;
+          size_t g = (size_t)src_rank * (size_t)num_tokens + (size_t)t;
+          size_t mid_base = (size_t)node_idx * (size_t)num_tokens * token_bytes;
+          const char *mid_ptr = (const char *)mid_buf + mid_base + (size_t)t * token_bytes;
+          for (int lr = 0; lr < node_npes; ++lr) {
+            int dst_rank = src_node * node_npes + lr;
+            int idx = intranode_index[g * (size_t)npes + (size_t)dst_rank];
+            if (idx < 0) continue;
+            size_t dst_offset = (size_t)idx * token_bytes;
+            nvshmem_putmem((char *)output_tokens + dst_offset, mid_ptr, token_bytes, dst_rank);
+          }
+        }
+        tile.sync();
+        if (tile.thread_rank() == 0) {
+          flag_ptr[0] = 0;
+        }
       }
     }
   }
 }
 
 static __device__ __forceinline__ void dispatch_stage2(
-    void *output_tokens, const IntranodeIndex *intranode_index, int num_tokens, int hidden_size,
+    const void *input_tokens, const int *intranode_index, int num_tokens, int hidden_size,
     int bytes_per_elem, int node_npes, int nnodes, const void *mid_buf, uint64_t *mid_flags,
-    int chunk_tokens_local, int num_chunks, int npes, int node_id, int local_rank,
+    int chunk_tokens_local, int num_chunks, int npes, int mype, int node_id, int local_rank,
     size_t token_bytes, cg::thread_block_tile<128> tile) {
   if (nnodes <= 1 || !mid_buf || !mid_flags) return;
   for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
     int t_begin = chunk_id * chunk_tokens_local;
     int t_end = t_begin + chunk_tokens_local;
     if (t_end > num_tokens) t_end = num_tokens;
-    for (int remote_node = 0; remote_node < nnodes; ++remote_node) {
-      if (remote_node == node_id) continue;
-      int node_idx = node_block_index(node_id, remote_node);
-      uint64_t *flag_ptr = mid_flags + (size_t)node_idx * (size_t)num_chunks + chunk_id;
-      nvshmem_signal_wait_until(flag_ptr, NVSHMEM_CMP_EQ, 1ull);
-      for (int t = t_begin + tile.thread_rank(); t < t_end; t += tile.size()) {
-        int src_rank = remote_node * node_npes + local_rank;
-        size_t g = (size_t)src_rank * (size_t)num_tokens + (size_t)t;
-        size_t mid_base = (size_t)node_idx * (size_t)num_tokens * token_bytes;
-        const char *mid_ptr = (const char *)mid_buf + mid_base + (size_t)t * token_bytes;
+    for (int t = t_begin + tile.thread_rank(); t < t_end; t += tile.size()) {
+      size_t src_offset = (size_t)t * token_bytes;
+      size_t g = (size_t)mype * (size_t)num_tokens + (size_t)t;
+      for (int dst_node = 0; dst_node < nnodes; ++dst_node) {
+        if (dst_node == node_id) continue;
+        bool need_send = false;
         for (int lr = 0; lr < node_npes; ++lr) {
-          if (lr == local_rank) continue;
-          int dst_rank = node_id * node_npes + lr;
-          const IntranodeIndex entry =
-              intranode_index[g * (size_t)npes + (size_t)dst_rank];
-          if (entry.index < 0 || entry.route != 2) continue;
-          size_t dst_offset = (size_t)entry.index * token_bytes;
-          nvshmem_putmem((char *)output_tokens + dst_offset, mid_ptr, token_bytes, dst_rank);
+          int dst_rank = dst_node * node_npes + lr;
+          int idx = intranode_index[g * (size_t)npes + (size_t)dst_rank];
+          if (idx >= 0) {
+            need_send = true;
+            break;
+          }
         }
+        if (!need_send) continue;
+        int node_idx = node_block_index(dst_node, node_id);
+        size_t mid_base = (size_t)node_idx * (size_t)num_tokens * token_bytes;
+        size_t mid_offset = mid_base + (size_t)t * token_bytes;
+        nvshmem_putmem((char *)mid_buf + mid_offset,
+                       (const char *)input_tokens + src_offset, token_bytes,
+                       dst_node * node_npes + local_rank);
       }
-      tile.sync();
-      nvshmem_quiet();
-      if (tile.thread_rank() == 0) {
-        flag_ptr[0] = 0;
+    }
+    tile.sync();
+    if (tile.thread_rank() == 0) {
+      for (int dst_node = 0; dst_node < nnodes; ++dst_node) {
+        if (dst_node == node_id) continue;
+        int node_idx = node_block_index(dst_node, node_id);
+        uint64_t *flag_ptr = mid_flags + (size_t)node_idx * (size_t)num_chunks + chunk_id;
+        nvshmemx_signal_op(flag_ptr, 1ull, NVSHMEM_SIGNAL_SET,
+                           dst_node * node_npes + local_rank);
       }
     }
   }
 }
 
-// 单 kernel 双阶段流水化：block 内一半线程做直发/写中转，另一半线程做中转转发
+// 单 kernel 双阶段流水化：block 内一半线程做直发/本节点转发，另一半线程做跨节点中转
 // chunk 以 token 数为粒度，并按 chunk_id % gridDim.x 映射到 block
 __global__ void dispatch_kernel(const void *input_tokens, void *output_tokens,
-                                const IntranodeIndex *intranode_index, int num_tokens,
+                                const int *intranode_index, int num_tokens,
                                 int hidden_size, int bytes_per_elem, int node_npes, int nnodes,
                                 const void *mid_buf, uint64_t *mid_flags, int chunk_tokens) {
   int npes = nvshmem_n_pes();
@@ -259,13 +243,13 @@ __global__ void dispatch_kernel(const void *input_tokens, void *output_tokens,
   else {
     int node_id = mype / node_npes;
     int local_rank = mype - node_id * node_npes;
-    dispatch_stage2(output_tokens, intranode_index, num_tokens, hidden_size, bytes_per_elem,
+    dispatch_stage2(input_tokens, intranode_index, num_tokens, hidden_size, bytes_per_elem,
                     node_npes, nnodes, mid_buf, mid_flags, chunk_tokens_local, num_chunks, npes,
-                    node_id, local_rank, token_bytes, tile);
+                    mype, node_id, local_rank, token_bytes, tile);
   }
 }
 // host 侧入口：生成 intranode_index
-int pre_process(const bool *routing_map, IntranodeIndex *intranode_index, const DispatchConfig *cfg) {
+int pre_process(const bool *routing_map, int *intranode_index, const DispatchConfig *cfg) {
   if (!cfg) return 1;
 
   int num_tokens = cfg->num_tokens_per_rank;
@@ -302,7 +286,7 @@ int pre_process(const bool *routing_map, IntranodeIndex *intranode_index, const 
 
 // host 侧入口：执行 dispatch 与可选的跨节点转发
 int dispatch_tokens(const void *input_tokens, void *output_tokens,
-                    const IntranodeIndex *intranode_index, const DispatchConfig *cfg) {
+                    const int *intranode_index, const DispatchConfig *cfg) {
   if (!cfg) return 1;
 
   int num_tokens = cfg->num_tokens_per_rank;
