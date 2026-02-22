@@ -4,6 +4,9 @@
 #include <nvshmem.h>
 #include <nvshmemx.h>
 #include <stddef.h>
+#include <cooperative_groups.h>
+
+namespace cg = cooperative_groups;
 
 // 全网格栅栏：基于计数器与翻转位，保证所有 block 完成前一阶段后再进入下一阶段
 // 该栅栏仅在单个 kernel 内使用，用于分阶段的并行前缀计算
@@ -129,112 +132,150 @@ __global__ void preprocess_kernel(const bool *routing_map, int *counts, int *off
   }
 }
 
-// 按 intranode_index 将本地 token 发送到目标 rank，输出缓冲为连续紧凑布局
-// route=0/1：直接写目标 rank 输出缓冲
-// route=2：写目标节点同号 local_rank 的 mid_buf，并置位 flag
+static __device__ __forceinline__ void dispatch_stage1(
+    const void *input_tokens, void *output_tokens, const IntranodeIndex *intranode_index,
+    int num_tokens, int hidden_size, int bytes_per_elem, int node_npes, int nnodes,
+    const void *mid_buf, uint64_t *mid_flags, int chunk_tokens_local, int num_chunks, int npes,
+    int mype, int src_node, int src_local, size_t token_bytes,
+    cg::thread_block_tile<128> tile) {
+  for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
+    int t_begin = chunk_id * chunk_tokens_local;
+    int t_end = t_begin + chunk_tokens_local;
+    if (t_end > num_tokens) t_end = num_tokens;
+    for (int t = t_begin + tile.thread_rank(); t < t_end; t += tile.size()) {
+      size_t src_offset = (size_t)t * token_bytes;
+      size_t g = (size_t)mype * (size_t)num_tokens + (size_t)t;
+      for (int j = 0; j < npes; ++j) {
+        const IntranodeIndex entry = intranode_index[g * (size_t)npes + (size_t)j];
+        int idx = entry.index;
+        if (idx < 0) continue;
+        if (entry.route == 0 || entry.route == 1) {
+          size_t dst_offset = (size_t)idx * token_bytes;
+          nvshmem_putmem((char *)output_tokens + dst_offset,
+                         (const char *)input_tokens + src_offset, token_bytes, j);
+        }
+      }
+      if (nnodes > 1 && mid_buf && mid_flags) {
+        for (int dst_node = 0; dst_node < nnodes; ++dst_node) {
+          if (dst_node == src_node) continue;
+          bool need_send = false;
+          for (int lr = 0; lr < node_npes; ++lr) {
+            int dst_rank = dst_node * node_npes + lr;
+            const IntranodeIndex entry =
+                intranode_index[g * (size_t)npes + (size_t)dst_rank];
+            if (entry.index >= 0 && entry.route == 2) {
+              need_send = true;
+              break;
+            }
+          }
+          if (!need_send) continue;
+          int node_idx = node_block_index(dst_node, src_node);
+          size_t mid_base = (size_t)node_idx * (size_t)num_tokens * token_bytes;
+          size_t mid_offset = mid_base + (size_t)t * token_bytes;
+          nvshmem_putmem((char *)mid_buf + mid_offset,
+                         (const char *)input_tokens + src_offset, token_bytes,
+                         dst_node * node_npes + src_local);
+        }
+      }
+    }
+    tile.sync();
+    nvshmem_quiet();
+    tile.sync();
+    if (nnodes > 1 && mid_buf && mid_flags && tile.thread_rank() == 0) {
+      for (int dst_node = 0; dst_node < nnodes; ++dst_node) {
+        if (dst_node == src_node) continue;
+        int node_idx = node_block_index(dst_node, src_node);
+        uint64_t *flag_ptr = mid_flags + (size_t)node_idx * (size_t)num_chunks + chunk_id;
+        nvshmemx_signal_op(flag_ptr, 1ull, NVSHMEM_SIGNAL_SET,
+                           dst_node * node_npes + src_local);
+      }
+    }
+  }
+}
+
+static __device__ __forceinline__ void dispatch_stage2(
+    void *output_tokens, const IntranodeIndex *intranode_index, int num_tokens, int hidden_size,
+    int bytes_per_elem, int node_npes, int nnodes, const void *mid_buf, uint64_t *mid_flags,
+    int chunk_tokens_local, int num_chunks, int npes, int node_id, int local_rank,
+    size_t token_bytes, cg::thread_block_tile<128> tile) {
+  if (nnodes <= 1 || !mid_buf || !mid_flags) return;
+  for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
+    int t_begin = chunk_id * chunk_tokens_local;
+    int t_end = t_begin + chunk_tokens_local;
+    if (t_end > num_tokens) t_end = num_tokens;
+    for (int remote_node = 0; remote_node < nnodes; ++remote_node) {
+      if (remote_node == node_id) continue;
+      int node_idx = node_block_index(node_id, remote_node);
+      uint64_t *flag_ptr = mid_flags + (size_t)node_idx * (size_t)num_chunks + chunk_id;
+      nvshmem_signal_wait_until(flag_ptr, NVSHMEM_CMP_EQ, 1ull);
+      for (int t = t_begin + tile.thread_rank(); t < t_end; t += tile.size()) {
+        int src_rank = remote_node * node_npes + local_rank;
+        size_t g = (size_t)src_rank * (size_t)num_tokens + (size_t)t;
+        size_t mid_base = (size_t)node_idx * (size_t)num_tokens * token_bytes;
+        const char *mid_ptr = (const char *)mid_buf + mid_base + (size_t)t * token_bytes;
+        for (int lr = 0; lr < node_npes; ++lr) {
+          if (lr == local_rank) continue;
+          int dst_rank = node_id * node_npes + lr;
+          const IntranodeIndex entry =
+              intranode_index[g * (size_t)npes + (size_t)dst_rank];
+          if (entry.index < 0 || entry.route != 2) continue;
+          size_t dst_offset = (size_t)entry.index * token_bytes;
+          nvshmem_putmem((char *)output_tokens + dst_offset, mid_ptr, token_bytes, dst_rank);
+        }
+      }
+      tile.sync();
+      nvshmem_quiet();
+      tile.sync();
+      if (tile.thread_rank() == 0) {
+        flag_ptr[0] = 0;
+      }
+    }
+  }
+}
+
+static __device__ __forceinline__ void dispatch_chunks(
+    const void *input_tokens, void *output_tokens, const IntranodeIndex *intranode_index,
+    int num_tokens, int hidden_size, int bytes_per_elem, int node_npes, int nnodes,
+    const void *mid_buf, uint64_t *mid_flags, int chunk_tokens_local, int num_chunks, int npes,
+    int mype, int src_node, int src_local, size_t token_bytes,
+    cg::thread_block_tile<128> tile) {
+  int tile_id = tile.meta_group_rank();
+  int tile_count = tile.meta_group_size();
+  bool stage1 = tile_id < (tile_count / 2);
+  if (stage1) {
+    dispatch_stage1(input_tokens, output_tokens, intranode_index, num_tokens, hidden_size,
+                    bytes_per_elem, node_npes, nnodes, mid_buf, mid_flags, chunk_tokens_local,
+                    num_chunks, npes, mype, src_node, src_local, token_bytes, tile);
+  }
+  else {
+    int node_id = mype / node_npes;
+    int local_rank = mype - node_id * node_npes;
+    dispatch_stage2(output_tokens, intranode_index, num_tokens, hidden_size, bytes_per_elem,
+                    node_npes, nnodes, mid_buf, mid_flags, chunk_tokens_local, num_chunks, npes,
+                    node_id, local_rank, token_bytes, tile);
+  }
+}
+
+// 单 kernel 双阶段流水化：block 内一半线程做直发/写中转，另一半线程做中转转发
+// chunk 以 token 数为粒度，并按 chunk_id % gridDim.x 映射到 block
 __global__ void dispatch_kernel(const void *input_tokens, void *output_tokens,
                                 const IntranodeIndex *intranode_index, int num_tokens,
                                 int hidden_size, int bytes_per_elem, int node_npes, int nnodes,
-                                const void *mid_buf, uint64_t *mid_flags) {
+                                const void *mid_buf, uint64_t *mid_flags, int chunk_tokens) {
   int npes = nvshmem_n_pes();
   if (npes <= 0) return;
 
   int mype = nvshmem_my_pe();
   int src_node = mype / node_npes;
   int src_local = mype - src_node * node_npes;
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int stride = blockDim.x * gridDim.x;
-  for (int t = tid; t < num_tokens; t += stride) {
-    // 每个 token 在连续缓冲中的字节长度
-    size_t token_bytes = (size_t)hidden_size * (size_t)bytes_per_elem;
-    // 本地 token 在 input_tokens 中的偏移
-    size_t src_offset = (size_t)t * token_bytes;
-    // global_token 索引
-    size_t g = (size_t)mype * (size_t)num_tokens + (size_t)t;
-    for (int j = 0; j < npes; ++j) {
-      const IntranodeIndex entry = intranode_index[g * (size_t)npes + (size_t)j];
-      int idx = entry.index;
-      if (idx < 0) continue;
-      // 目标输出在 dst 端的紧凑位置
-      size_t dst_offset = (size_t)idx * token_bytes;
-      if (entry.route == 0 || entry.route == 1) {
-        // 同节点或跨节点同号 local_rank，直接写目标输出缓冲
-        nvshmem_putmem((char *)output_tokens + dst_offset,
-                       (const char *)input_tokens + src_offset, token_bytes, j);
-      } else {
-        int dst_node = j / node_npes;
-        int dst_local = j - dst_node * node_npes;
-        if (dst_local != src_local && nnodes > 1 && mid_buf && mid_flags) {
-          // 跨节点异号 local_rank：写入目标节点同号 local_rank 的中转缓冲
-          int node_idx = node_block_index(dst_node, src_node);
-          size_t mid_base = (size_t)node_idx * (size_t)num_tokens * token_bytes;
-          size_t mid_offset = mid_base + (size_t)t * token_bytes;
-          uint64_t *flag_ptr = mid_flags + (size_t)node_idx * (size_t)num_tokens + t;
-          nvshmem_putmem((char *)mid_buf + mid_offset, (const char *)input_tokens + src_offset,
-                         token_bytes, dst_node * node_npes + src_local);
-          nvshmem_fence();
-          // 置位 flag 表示该 token 已到达中转缓冲
-          nvshmemx_signal_op(flag_ptr, 1ull, NVSHMEM_SIGNAL_SET,
-                             dst_node * node_npes + src_local);
-        }
-      }
-    }
-  }
-}
-
-// 在目标节点同号 local_rank 上执行的中继 kernel
-// 读取 mid_buf 中收到的 token 并转发到本节点内其它 local_rank 的输出缓冲
-__global__ void relay_kernel(void *output_tokens, const IntranodeIndex *intranode_index,
-                             int num_tokens, int hidden_size, int bytes_per_elem, int node_npes,
-                             int nnodes, const void *mid_buf, uint64_t *mid_flags) {
-  int npes = nvshmem_n_pes();
-  if (npes <= 0 || nnodes <= 1 || !mid_buf || !mid_flags) return;
-
-  int mype = nvshmem_my_pe();
-  int node_id = mype / node_npes;
-  int local_rank = mype - node_id * node_npes;
   size_t token_bytes = (size_t)hidden_size * (size_t)bytes_per_elem;
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int stride = blockDim.x * gridDim.x;
-  for (int t = tid; t < num_tokens; t += stride) {
-    for (int remote_node = 0; remote_node < nnodes; ++remote_node) {
-      if (remote_node == node_id) continue;
-      int node_idx = node_block_index(node_id, remote_node);
-      // 该节点上同号 local_rank 作为转发源的 rank
-      int src_rank = remote_node * node_npes + local_rank;
-      size_t g = (size_t)src_rank * (size_t)num_tokens + (size_t)t;
-      bool need_forward = false;
-      // 判断本地节点是否存在需要转发的目标
-      for (int lr = 0; lr < node_npes; ++lr) {
-        if (lr == local_rank) continue;
-        int dst_rank = node_id * node_npes + lr;
-        const IntranodeIndex entry =
-            intranode_index[g * (size_t)npes + (size_t)dst_rank];
-        if (entry.index >= 0 && entry.route == 2) {
-          need_forward = true;
-          break;
-        }
-      }
-      if (!need_forward) continue;
-      uint64_t *flag_ptr = mid_flags + (size_t)node_idx * (size_t)num_tokens + t;
-      // 等待该 token 的中转数据到达
-      nvshmem_signal_wait_until(flag_ptr, NVSHMEM_CMP_EQ, 1ull);
-      size_t mid_base = (size_t)node_idx * (size_t)num_tokens * token_bytes;
-      const char *mid_ptr = (const char *)mid_buf + mid_base + (size_t)t * token_bytes;
-      // 向本节点内其它 local_rank 转发
-      for (int lr = 0; lr < node_npes; ++lr) {
-        if (lr == local_rank) continue;
-        int dst_rank = node_id * node_npes + lr;
-        const IntranodeIndex entry =
-            intranode_index[g * (size_t)npes + (size_t)dst_rank];
-        if (entry.index < 0 || entry.route != 2) continue;
-        size_t dst_offset = (size_t)entry.index * token_bytes;
-        nvshmem_putmem((char *)output_tokens + dst_offset, mid_ptr, token_bytes, dst_rank);
-      }
-      // 重置 flag，便于下一次复用
-      flag_ptr[0] = 0;
-    }
-  }
+  int chunk_tokens_local = chunk_tokens > 0 ? chunk_tokens : num_tokens;
+  int num_chunks = (num_tokens + chunk_tokens_local - 1) / chunk_tokens_local;
+  if (num_chunks <= 0) return;
+  auto tile = cg::tiled_partition<128>(cg::this_thread_block());
+  dispatch_chunks(input_tokens, output_tokens, intranode_index, num_tokens, hidden_size,
+                  bytes_per_elem, node_npes, nnodes, mid_buf, mid_flags, chunk_tokens_local,
+                  num_chunks, npes, mype, src_node, src_local, token_bytes, tile);
 }
 // host 侧入口：生成 intranode_index
 int pre_process(const bool *routing_map, IntranodeIndex *intranode_index, const DispatchConfig *cfg) {
@@ -284,21 +325,16 @@ int dispatch_tokens(const void *input_tokens, void *output_tokens,
   int nnodes = cfg->nnodes;
   const void *mid_buf = cfg->mid_buf;
   uint64_t *mid_flags = cfg->mid_flags;
+  // chunk_tokens 控制每个 chunk 的 token 数
+  int chunk_tokens = cfg->chunk_tokens;
 
   int threads = 256;
   int blocks = (num_tokens + threads - 1) / threads;
   if (cfg->blocks_per_kernel > 0) blocks = cfg->blocks_per_kernel;
   dispatch_kernel<<<blocks, threads>>>(input_tokens, output_tokens, intranode_index, num_tokens,
                                        hidden_size, bytes_per_elem, node_npes, nnodes, mid_buf,
-                                       mid_flags);
+                                       mid_flags, chunk_tokens);
   // 确保本 rank 发起的 put 已提交
   nvshmem_quiet();
-  // 跨节点转发：等待所有 rank 完成直发/写中转，再由中继 rank 处理转发
-  if (nnodes > 1 && mid_buf && mid_flags) {
-    nvshmem_barrier_all();
-    relay_kernel<<<blocks, threads>>>(output_tokens, intranode_index, num_tokens, hidden_size,
-                                      bytes_per_elem, node_npes, nnodes, mid_buf, mid_flags);
-    nvshmem_quiet();
-  }
   return 0;
 }

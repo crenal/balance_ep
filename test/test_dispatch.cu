@@ -37,7 +37,7 @@ struct TestBuffers {
 
 static int allocate_buffers(TestBuffers *buf, size_t input_bytes, size_t output_bytes,
                             size_t map_bytes, size_t intranode_elems,
-                            int num_tokens_per_rank, int npes, int nnodes) {
+                            int num_tokens_per_rank, int npes, int nnodes, int num_chunks) {
   // input/output 需要对称内存，保证跨 rank 可访问
   buf->input_tokens = (float *)nvshmem_malloc(input_bytes);
   buf->output_tokens = (float *)nvshmem_malloc(output_bytes);
@@ -49,9 +49,7 @@ static int allocate_buffers(TestBuffers *buf, size_t input_bytes, size_t output_
   // 每个 rank 分配 (nnodes-1) 块中转缓冲与 flag
   buf->mid_buf_bytes = (nnodes > 1) ? (size_t)(nnodes - 1) * input_bytes : 0;
   buf->mid_flags_bytes =
-      (nnodes > 1)
-          ? (size_t)(nnodes - 1) * (size_t)num_tokens_per_rank * sizeof(uint64_t)
-          : 0;
+      (nnodes > 1) ? (size_t)(nnodes - 1) * (size_t)num_chunks * sizeof(uint64_t) : 0;
   buf->mid_buf = buf->mid_buf_bytes > 0 ? nvshmem_malloc(buf->mid_buf_bytes) : nullptr;
   buf->mid_flags =
       buf->mid_flags_bytes > 0 ? (uint64_t *)nvshmem_malloc(buf->mid_flags_bytes) : nullptr;
@@ -358,14 +356,19 @@ int main(int argc, char **argv) {
   int hidden_size = 8192;
   int topk = 4;
   int blocks_per_kernel = 8;
+  // chunk_tokens 控制每个 chunk 的 token 数，影响 flag 数量与流水化程度
+  int chunk_tokens = 256;
   read_env_int("NUM_TOKENS_PER_RANK", &num_tokens_per_rank);
   read_env_int("EXPERT_NUM", &expert_num);
   read_env_int("HIDDEN_SIZE", &hidden_size);
   read_env_int("TOPK", &topk);
   read_env_int("BLOCKS_PER_KERNEL", &blocks_per_kernel);
+  read_env_int("CHUNK_TOKENS", &chunk_tokens);
   if (topk > expert_num) topk = expert_num;
   const int bytes_per_elem = (int)sizeof(float);
   size_t token_bytes = (size_t)hidden_size * (size_t)bytes_per_elem;
+  if (chunk_tokens <= 0) chunk_tokens = num_tokens_per_rank;
+  int num_chunks = (num_tokens_per_rank + chunk_tokens - 1) / chunk_tokens;
   size_t input_bytes = (size_t)num_tokens_per_rank * token_bytes;
   size_t output_bytes = (size_t)npes * (size_t)num_tokens_per_rank * token_bytes;
   size_t global_tokens = (size_t)num_tokens_per_rank * (size_t)npes;
@@ -376,7 +379,7 @@ int main(int argc, char **argv) {
   TestBuffers buf = {};
   int status = allocate_buffers(&buf, input_bytes, output_bytes, map_bytes,
                                 (size_t)global_tokens * (size_t)npes, num_tokens_per_rank, npes,
-                                nnodes);
+                                nnodes, num_chunks);
   if (status != 0) {
     free_buffers(&buf);
     nvshmem_finalize();
@@ -393,6 +396,7 @@ int main(int argc, char **argv) {
   cfg.hidden_size = hidden_size;
   cfg.bytes_per_elem = bytes_per_elem;
   cfg.blocks_per_kernel = blocks_per_kernel;
+  cfg.chunk_tokens = chunk_tokens;
   cfg.node_npes = node_npes;
   cfg.nnodes = nnodes;
   cfg.mid_buf = buf.mid_buf;
