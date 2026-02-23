@@ -140,7 +140,6 @@ static __device__ __forceinline__ void dispatch_stage1(
                        (const char *)input_tokens + src_offset, token_bytes, dst_rank);
       }
     }
-    // tile.sync();
     if (nnodes > 1 && mid_buf && mid_flags) {
       for (int remote_node = 0; remote_node < nnodes; ++remote_node) {
         if (remote_node == src_node) continue;
