@@ -123,11 +123,13 @@ static __device__ __forceinline__ void dispatch_stage1(
     const void *mid_buf, uint64_t *mid_flags, int chunk_tokens_local, int num_chunks, int npes,
     int mype, int src_node, int src_local, size_t token_bytes,
     cg::thread_block_tile<128> tile) {
+  int warp_id = tile.thread_rank() >> 5;
+  int num_warps = tile.size() >> 5;
   for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
     int t_begin = chunk_id * chunk_tokens_local;
     int t_end = t_begin + chunk_tokens_local;
     if (t_end > num_tokens) t_end = num_tokens;
-    for (int t = t_begin + tile.thread_rank(); t < t_end; t += tile.size()) {
+    for (int t = t_begin + warp_id; t < t_end; t += num_warps) {
       size_t src_offset = (size_t)t * token_bytes;
       size_t g = (size_t)mype * (size_t)num_tokens + (size_t)t;
       int node_base = src_node * node_npes;
@@ -136,8 +138,8 @@ static __device__ __forceinline__ void dispatch_stage1(
         int idx = intranode_index[g * (size_t)npes + (size_t)dst_rank];
         if (idx < 0) continue;
         size_t dst_offset = (size_t)idx * token_bytes;
-        nvshmem_putmem((char *)output_tokens + dst_offset,
-                       (const char *)input_tokens + src_offset, token_bytes, dst_rank);
+        nvshmemx_putmem_warp((char *)output_tokens + dst_offset,
+                             (const char *)input_tokens + src_offset, token_bytes, dst_rank);
       }
     }
     if (nnodes > 1 && mid_buf && mid_flags) {
@@ -146,7 +148,7 @@ static __device__ __forceinline__ void dispatch_stage1(
         int node_idx = node_block_index(src_node, remote_node);
         uint64_t *flag_ptr = mid_flags + (size_t)node_idx * (size_t)num_chunks + chunk_id;
         nvshmem_signal_wait_until(flag_ptr, NVSHMEM_CMP_EQ, 1ull);
-        for (int t = t_begin + tile.thread_rank(); t < t_end; t += tile.size()) {
+        for (int t = t_begin + warp_id; t < t_end; t += num_warps) {
           int src_rank = remote_node * node_npes + src_local;
           size_t g = (size_t)src_rank * (size_t)num_tokens + (size_t)t;
           size_t mid_base = (size_t)node_idx * (size_t)num_tokens * token_bytes;
@@ -156,7 +158,8 @@ static __device__ __forceinline__ void dispatch_stage1(
             int idx = intranode_index[g * (size_t)npes + (size_t)dst_rank];
             if (idx < 0) continue;
             size_t dst_offset = (size_t)idx * token_bytes;
-            nvshmem_putmem((char *)output_tokens + dst_offset, mid_ptr, token_bytes, dst_rank);
+            nvshmemx_putmem_warp((char *)output_tokens + dst_offset, mid_ptr, token_bytes,
+                                 dst_rank);
           }
         }
         tile.sync();
@@ -173,12 +176,14 @@ static __device__ __forceinline__ void dispatch_stage2(
     int bytes_per_elem, int node_npes, int nnodes, const void *mid_buf, uint64_t *mid_flags,
     int chunk_tokens_local, int num_chunks, int npes, int mype, int node_id, int local_rank,
     size_t token_bytes, cg::thread_block_tile<128> tile) {
+  int warp_id = tile.thread_rank() >> 5;
+  int num_warps = tile.size() >> 5;
   if (nnodes <= 1 || !mid_buf || !mid_flags) return;
   for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
     int t_begin = chunk_id * chunk_tokens_local;
     int t_end = t_begin + chunk_tokens_local;
     if (t_end > num_tokens) t_end = num_tokens;
-    for (int t = t_begin + tile.thread_rank(); t < t_end; t += tile.size()) {
+    for (int t = t_begin + warp_id; t < t_end; t += num_warps) {
       size_t src_offset = (size_t)t * token_bytes;
       size_t g = (size_t)mype * (size_t)num_tokens + (size_t)t;
       for (int dst_node = 0; dst_node < nnodes; ++dst_node) {
@@ -196,9 +201,9 @@ static __device__ __forceinline__ void dispatch_stage2(
         int node_idx = node_block_index(dst_node, node_id);
         size_t mid_base = (size_t)node_idx * (size_t)num_tokens * token_bytes;
         size_t mid_offset = mid_base + (size_t)t * token_bytes;
-        nvshmem_putmem((char *)mid_buf + mid_offset,
-                       (const char *)input_tokens + src_offset, token_bytes,
-                       dst_node * node_npes + local_rank);
+        nvshmemx_putmem_warp((char *)mid_buf + mid_offset,
+                             (const char *)input_tokens + src_offset, token_bytes,
+                             dst_node * node_npes + local_rank);
       }
     }
     tile.sync();
@@ -233,6 +238,14 @@ __global__ void dispatch_kernel(const void *input_tokens, void *output_tokens,
   auto tile = cg::tiled_partition<128>(cg::this_thread_block());
   int tile_id = tile.meta_group_rank();
   int tile_count = tile.meta_group_size();
+  if (nnodes <= 1) {
+    if (tile_id == 0) {
+      dispatch_stage1(input_tokens, output_tokens, intranode_index, num_tokens, hidden_size,
+                      bytes_per_elem, node_npes, nnodes, mid_buf, mid_flags, chunk_tokens_local,
+                      num_chunks, npes, mype, src_node, src_local, token_bytes, tile);
+    }
+    return;
+  }
   bool stage1 = tile_id < (tile_count / 2);
   if (stage1) {
     dispatch_stage1(input_tokens, output_tokens, intranode_index, num_tokens, hidden_size,
