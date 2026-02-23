@@ -143,11 +143,15 @@ static __device__ __forceinline__ void dispatch_stage1(
       }
     }
     if (nnodes > 1 && mid_buf && mid_flags) {
-      for (int remote_node = 0; remote_node < nnodes; ++remote_node) {
-        if (remote_node == src_node) continue;
+      for (int k = 1; k < nnodes; ++k) {
+        int remote_node = src_node - k;
+        if (remote_node < 0) remote_node += nnodes;
         int node_idx = node_block_index(src_node, remote_node);
         uint64_t *flag_ptr = mid_flags + (size_t)node_idx * (size_t)num_chunks + chunk_id;
-        nvshmem_signal_wait_until(flag_ptr, NVSHMEM_CMP_EQ, 1ull);
+        if (tile.thread_rank() == 0) {
+          nvshmem_signal_wait_until(flag_ptr, NVSHMEM_CMP_EQ, 1ull);
+        }
+        tile.sync();
         for (int t = t_begin + warp_id; t < t_end; t += num_warps) {
           int src_rank = remote_node * node_npes + src_local;
           size_t g = (size_t)src_rank * (size_t)num_tokens + (size_t)t;
@@ -186,8 +190,9 @@ static __device__ __forceinline__ void dispatch_stage2(
     for (int t = t_begin + warp_id; t < t_end; t += num_warps) {
       size_t src_offset = (size_t)t * token_bytes;
       size_t g = (size_t)mype * (size_t)num_tokens + (size_t)t;
-      for (int dst_node = 0; dst_node < nnodes; ++dst_node) {
-        if (dst_node == node_id) continue;
+      for (int k = 1; k < nnodes; ++k) {
+        int dst_node = node_id + k;
+        if (dst_node >= nnodes) dst_node -= nnodes;
         bool need_send = false;
         for (int lr = 0; lr < node_npes; ++lr) {
           int dst_rank = dst_node * node_npes + lr;
@@ -208,8 +213,9 @@ static __device__ __forceinline__ void dispatch_stage2(
     }
     tile.sync();
     if (tile.thread_rank() == 0) {
-      for (int dst_node = 0; dst_node < nnodes; ++dst_node) {
-        if (dst_node == node_id) continue;
+      for (int k = 1; k < nnodes; ++k) {
+        int dst_node = node_id + k;
+        if (dst_node >= nnodes) dst_node -= nnodes;
         int node_idx = node_block_index(dst_node, node_id);
         uint64_t *flag_ptr = mid_flags + (size_t)node_idx * (size_t)num_chunks + chunk_id;
         nvshmemx_signal_op(flag_ptr, 1ull, NVSHMEM_SIGNAL_SET,
