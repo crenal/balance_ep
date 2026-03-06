@@ -12,6 +12,7 @@ CHUNK_TOKENS=${CHUNK_TOKENS:-32}
 NNODES=${NNODES:-2}
 RANKS_PER_NODE=${RANKS_PER_NODE:-4}
 NP=${NP:-8}
+SSH_PORT=${SSH_PORT:-2345}
 
 #bench
 BENCH_ONLY=${BENCH_ONLY:-0}
@@ -21,7 +22,7 @@ BENCH_WARMUP=${BENCH_WARMUP:-5}
 #数据偏斜
 ZIPF_ALPHA=${ZIPF_ALPHA:-0.5}
 
-
+export NVSHMEM_BOOTSTRAP_LIBRARY=/workspace/nvshmem_install/lib/nvshmem_bootstrap_mpi.so
 
 NUM_TOKENS_PER_RANK=$NUM_TOKENS_PER_RANK \
 ZIPF_ALPHA=$ZIPF_ALPHA \
@@ -30,10 +31,9 @@ HIDDEN_SIZE=$HIDDEN_SIZE \
 TOPK=$TOPK \
 BLOCKS_PER_KERNEL=$BLOCKS_PER_KERNEL \
 CHUNK_TOKENS=$CHUNK_TOKENS \
-NVSHMEM_BOOTSTRAP=mpi \
-NVSHMEM_BOOTSTRAP_LIBRARY=/workspace/nvshmem_install/lib/nvshmem_bootstrap_mpi.so \
+NVSHMEM_BOOTSTRAP=MPI \
 BENCH_ONLY=$BENCH_ONLY \
 BENCH_ITERS=$BENCH_ITERS \
 BENCH_WARMUP=$BENCH_WARMUP \
-/usr/local/openmpi/bin/mpirun --allow-run-as-root -np $NP \
-./build/test_dispatch --nnodes $NNODES --ranks_per_node $RANKS_PER_NODE
+/usr/local/openmpi/bin/mpirun --allow-run-as-root --mca plm_rsh_agent "ssh -p ${SSH_PORT}" --mca oob_tcp_if_include eth0 --mca btl_tcp_if_include eth0 --hostfile hostfile -np $NP  -x NVSHMEM_BOOTSTRAP=MPI -x NVSHMEM_BOOTSTRAP_LIBRARY=$NVSHMEM_BOOTSTRAP_LIBRARY \
+/workspace/balance_ep/build/test_dispatch --nnodes $NNODES --ranks_per_node $RANKS_PER_NODE
