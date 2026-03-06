@@ -374,6 +374,27 @@ static int read_env_float01(const char *name, float *out) {
 }
 
 int main(int argc, char **argv) {
+  // 解析命令行参数：可选覆盖 nnodes 与 ranks_per_node
+  int override_nnodes = 0;
+  int override_rpn = 0;
+  for (int i = 1; i < argc; ++i) {
+    if (strcmp(argv[i], "--nnodes") == 0 && i + 1 < argc) {
+      if (!parse_positive_int(argv[i + 1], &override_nnodes)) return 1;
+      ++i;
+      continue;
+    }
+    if (strcmp(argv[i], "--ranks_per_node") == 0 && i + 1 < argc) {
+      if (!parse_positive_int(argv[i + 1], &override_rpn)) return 1;
+      ++i;
+      continue;
+    }
+    if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+      printf("Usage: %s [--nnodes N] [--ranks_per_node R]\n", argv[0]);
+      return 0;
+    }
+    return 1;
+  }
+
   // 初始化 NVSHMEM
   printf(" nvshmem_init\n");
   nvshmem_init();
