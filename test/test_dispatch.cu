@@ -5,11 +5,14 @@
 #include <nvshmem.h>
 #include <nvshmemx.h>
 #include <errno.h>
+#include <math.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static int read_env_float01(const char *name, float *out);
 
 // 简单线性同余随机数，用于构造稳定可复现的 routing_map
 static unsigned int next_rand(unsigned int *state) {
@@ -100,6 +103,56 @@ static void generate_map(bool *map_h, size_t global_tokens, int expert_num, int 
   }
 }
 
+static void generate_map_zipf(bool *map_h, size_t global_tokens, int expert_num, int topk, float alpha) {
+  if (alpha < 0.0f) alpha = 0.0f;
+  if (alpha > 1.0f) alpha = 1.0f;
+  if (expert_num <= 0) return;
+  double *cdf = (double *)malloc((size_t)expert_num * sizeof(double));
+  if (!cdf) {
+    generate_map(map_h, global_tokens, expert_num, topk);
+    return;
+  }
+  double sum = 0.0;
+  for (int e = 0; e < expert_num; ++e) {
+    sum += 1.0 / pow((double)(e + 1), (double)alpha);
+  }
+  double acc = 0.0;
+  for (int e = 0; e < expert_num; ++e) {
+    acc += (1.0 / pow((double)(e + 1), (double)alpha)) / sum;
+    cdf[e] = acc;
+  }
+  cdf[expert_num - 1] = 1.0;
+
+  unsigned int state = 1234u;
+  int kmax = topk > expert_num ? expert_num : topk;
+  for (size_t gt = 0; gt < global_tokens; ++gt) {
+    size_t row = gt * (size_t)expert_num;
+    for (int e = 0; e < expert_num; ++e) {
+      map_h[row + (size_t)e] = false;
+    }
+    int filled = 0;
+    while (filled < kmax) {
+      double u = ((double)next_rand(&state) + 0.5) / 4294967296.0;
+      int lo = 0;
+      int hi = expert_num - 1;
+      while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (u <= cdf[mid]) {
+          hi = mid;
+        } else {
+          lo = mid + 1;
+        }
+      }
+      int idx = lo;
+      if (!map_h[row + (size_t)idx]) {
+        map_h[row + (size_t)idx] = true;
+        filled++;
+      }
+    }
+  }
+  free(cdf);
+}
+
 static void init_inputs(TestBuffers *buf, int num_tokens_per_rank, int hidden_size, int mype,
                         int npes, int expert_num, int topk, size_t input_bytes,
                         size_t output_bytes, size_t map_bytes) {
@@ -121,7 +174,12 @@ static void init_inputs(TestBuffers *buf, int num_tokens_per_rank, int hidden_si
 
   // 生成全局 routing_map 并拷贝到设备侧
   size_t global_tokens = (size_t)num_tokens_per_rank * (size_t)npes;
-  generate_map(buf->map_h, global_tokens, expert_num, topk);
+  float zipf_alpha = 0.0f;
+  if (read_env_float01("ZIPF_ALPHA", &zipf_alpha)) {
+    generate_map_zipf(buf->map_h, global_tokens, expert_num, topk, zipf_alpha);
+  } else {
+    generate_map(buf->map_h, global_tokens, expert_num, topk);
+  }
   cudaMemcpy(buf->routing_map, buf->map_h, map_bytes, cudaMemcpyHostToDevice);
 }
 
@@ -291,11 +349,28 @@ static int parse_positive_int(const char *text, int *out) {
   return 1;
 }
 
+static int parse_float_01(const char *text, float *out) {
+  if (!text || !out) return 0;
+  errno = 0;
+  char *end = nullptr;
+  double value = strtod(text, &end);
+  if (errno != 0 || end == text || *end != '\0') return 0;
+  if (!(value >= 0.0 && value <= 1.0)) return 0;
+  *out = (float)value;
+  return 1;
+}
+
 static int read_env_int(const char *name, int *out) {
   // 从环境变量读取正整数，不存在则保持默认值
   const char *value = getenv(name);
   if (!value || value[0] == '\0') return 0;
   return parse_positive_int(value, out);
+}
+
+static int read_env_float01(const char *name, float *out) {
+  const char *value = getenv(name);
+  if (!value || value[0] == '\0') return 0;
+  return parse_float_01(value, out);
 }
 
 int main(int argc, char **argv) {

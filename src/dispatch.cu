@@ -299,6 +299,10 @@ int pre_process(const bool *routing_map, int *intranode_index, const DispatchCon
   preprocess_kernel<<<blocks, threads>>>(routing_map, counts, offsets, intranode_index,
                                          local_counts, num_tokens, expert_num, node_npes, blocks,
                                          barrier_counter, barrier_sense);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return 1;
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) return 1;
   return 0;
 }
 
@@ -323,6 +327,10 @@ int dispatch_tokens(const void *input_tokens, void *output_tokens,
   dispatch_kernel<<<blocks, threads>>>(input_tokens, output_tokens, intranode_index, num_tokens,
                                        hidden_size, bytes_per_elem, node_npes, nnodes, mid_buf,
                                        mid_flags, chunk_tokens);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return 1;
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) return 1;
   // 确保本 rank 发起的 put 已提交
   nvshmem_quiet();
   return 0;
