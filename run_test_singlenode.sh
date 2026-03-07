@@ -26,10 +26,6 @@ export NVSHMEM_BOOTSTRAP_LIBRARY=/workspace/nvshmem_install/lib/nvshmem_bootstra
 
 /usr/local/openmpi/bin/mpirun \
   --allow-run-as-root \
-  --mca plm_rsh_agent "ssh -p ${SSH_PORT}" \
-  --mca oob_tcp_if_include eth0 \
-  --mca btl_tcp_if_include eth0 \
-  --hostfile hostfile \
   -np "$NP" \
   -x NUM_TOKENS_PER_RANK="$NUM_TOKENS_PER_RANK" \
   -x ZIPF_ALPHA="$ZIPF_ALPHA" \
@@ -43,8 +39,6 @@ export NVSHMEM_BOOTSTRAP_LIBRARY=/workspace/nvshmem_install/lib/nvshmem_bootstra
   -x BENCH_ONLY="$BENCH_ONLY" \
   -x BENCH_ITERS="$BENCH_ITERS" \
   -x BENCH_WARMUP="$BENCH_WARMUP" \
-  -x NVSHMEM_SYMMETRIC_SIZE=2G \
-  -x NVSHMEM_DEBUG=INFO \
   /workspace/balance_ep/build/test_dispatch \
   --nnodes "$NNODES" \
   --ranks_per_node "$RANKS_PER_NODE"
