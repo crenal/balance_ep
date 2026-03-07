@@ -51,6 +51,27 @@ static int sample_cdf(const float *cdf, int n, float u) {
   return i;
 }
 
+static inline int clamp_kmax(int topk, int limit) {
+  int kmax = topk < 1 ? 1 : topk;
+  if (kmax > limit) kmax = limit;
+  return kmax;
+}
+
+static inline void mark_rank_experts(bool *map_h, size_t row, int expert_num, int experts_per_rank,
+                                     int dst, int kmax) {
+  int start = dst * experts_per_rank;
+  if (start >= expert_num) return;
+  int end = start + experts_per_rank;
+  if (end > expert_num) end = expert_num;
+  int experts_here = end - start;
+  if (experts_here <= 0) return;
+  int kmax_node = clamp_kmax(kmax, experts_here);
+  for (int s = 0; s < kmax_node; ++s) {
+    int e = start + s;
+    map_h[row + (size_t)e] = true;
+  }
+}
+
 static void generate_map(bool *map_h, size_t global_tokens, int num_tokens_per_rank, int npes,
                          int nnodes, int node_npes, int expert_num, int topk, float alpha) {
   if (alpha < 0.0f) alpha = 0.0f;
@@ -61,15 +82,20 @@ static void generate_map(bool *map_h, size_t global_tokens, int num_tokens_per_r
 
   float zipf_s = 0.0f;
   const float zipf_s_max = 12.0f;
-  if (alpha > 0.0f && alpha < 1.0f) zipf_s = alpha * zipf_s_max;
+  zipf_s = alpha * zipf_s_max;
 
-  float *node_cdf = nullptr;
   float *rank_cdf = nullptr;
-  if (zipf_s > 0.0f) {
-    node_cdf = (float *)malloc((size_t)nnodes * sizeof(float));
-    rank_cdf = (float *)malloc((size_t)node_npes * sizeof(float));
-    if (node_cdf) build_zipf_cdf(node_cdf, nnodes, zipf_s);
-    if (rank_cdf) build_zipf_cdf(rank_cdf, node_npes, zipf_s);
+  rank_cdf = (float *)malloc((size_t)node_npes * sizeof(float));
+  if (rank_cdf) build_zipf_cdf(rank_cdf, node_npes, zipf_s);
+
+  unsigned int *rank_used = (unsigned int *)malloc((size_t)npes * sizeof(unsigned int));
+  unsigned int *node_used = (unsigned int *)malloc((size_t)nnodes * sizeof(unsigned int));
+  unsigned int stamp = 1;
+  if (rank_used) {
+    for (int i = 0; i < npes; ++i) rank_used[i] = 0;
+  }
+  if (node_used) {
+    for (int i = 0; i < nnodes; ++i) node_used[i] = 0;
   }
 
   for (size_t gt = 0; gt < global_tokens; ++gt) {
@@ -78,55 +104,67 @@ static void generate_map(bool *map_h, size_t global_tokens, int num_tokens_per_r
       map_h[row + (size_t)e] = false;
     }
 
-    int src = (int)(gt / (size_t)num_tokens_per_rank);
-    (void)src;
+    (void)num_tokens_per_rank;
+    int k_ranks = clamp_kmax(topk, npes);
+    int kmax = 1;
 
-    int dst_node = 0;
-    int localrank = 0;
-    if (alpha <= 0.0f) {
-      float u0 = u32_to_unit_float(mix_u32((unsigned int)gt ^ 0x243f6a88u));
-      float u1 = u32_to_unit_float(mix_u32((unsigned int)gt ^ 0x85a308d3u));
-      dst_node = (int)(u0 * (float)nnodes);
-      if (dst_node >= nnodes) dst_node = nnodes - 1;
-      localrank = (int)(u1 * (float)node_npes);
-      if (localrank >= node_npes) localrank = node_npes - 1;
-    } else if (alpha >= 1.0f) {
-      dst_node = 0;
-      localrank = 0;
-    } else {
-      float u0 = u32_to_unit_float(mix_u32((unsigned int)gt ^ 0x243f6a88u));
-      float u1 = u32_to_unit_float(mix_u32((unsigned int)gt ^ 0x85a308d3u));
-      if (node_cdf) {
-        dst_node = sample_cdf(node_cdf, nnodes, u0);
-      } else {
-        dst_node = 0;
+    if (!rank_used || !node_used || !rank_cdf) {
+      for (int i = 0; i < k_ranks; ++i) {
+        mark_rank_experts(map_h, row, expert_num, experts_per_rank, i, kmax);
       }
-      if (rank_cdf) {
-        localrank = sample_cdf(rank_cdf, node_npes, u1);
-      } else {
-        localrank = 0;
-      }
+      continue;
     }
 
-    int dst = dst_node * node_npes + localrank;
-    if (dst < 0 || dst >= npes) continue;
+    if (stamp == 0) {
+      for (int i = 0; i < npes; ++i) rank_used[i] = 0;
+      for (int i = 0; i < nnodes; ++i) node_used[i] = 0;
+      stamp = 1;
+    }
+    unsigned int token_stamp = stamp++;
 
-    int kmax = topk;
-    if (kmax < 1) kmax = 1;
-    int start = dst * experts_per_rank;
-    if (start >= expert_num) continue;
-    int end = start + experts_per_rank;
-    if (end > expert_num) end = expert_num;
-    int experts_here = end - start;
-    if (experts_here <= 0) continue;
-    if (kmax > experts_here) kmax = experts_here;
+    int selected = 0;
+    int prefer_unique_nodes = (k_ranks <= nnodes) ? 1 : 0;
+    int max_attempts = npes * 16;
 
-    for (int s = 0; s < kmax; ++s) {
-      int e = start + s;
-      map_h[row + (size_t)e] = true;
+    for (int pick = 0; pick < k_ranks; ++pick) {
+      int dst_node = 0;
+      if (prefer_unique_nodes) {
+        int attempts = 0;
+        while (attempts++ < nnodes * 8) {
+          unsigned int seed_node =
+              (unsigned int)gt ^ 0x243f6a88u ^ (unsigned int)pick * 0x9e3779b9u ^
+              (unsigned int)attempts * 0x7f4a7c15u;
+          int cand = (int)(mix_u32(seed_node) % (unsigned int)nnodes);
+          if (node_used[cand] != token_stamp) {
+            dst_node = cand;
+            node_used[cand] = token_stamp;
+            break;
+          }
+        }
+      } else {
+        unsigned int seed_node = (unsigned int)gt ^ 0x243f6a88u ^ (unsigned int)pick * 0x9e3779b9u;
+        dst_node = (int)(mix_u32(seed_node) % (unsigned int)nnodes);
+      }
+
+      int attempts = 0;
+      while (attempts++ < max_attempts) {
+        unsigned int seed =
+            (unsigned int)gt ^ (unsigned int)dst_node * 0x9e3779b9u ^ (unsigned int)pick * 0x85a308d3u ^
+            (unsigned int)attempts * 0x632be59bu;
+        float u = u32_to_unit_float(mix_u32(seed));
+        int localrank = sample_cdf(rank_cdf, node_npes, u);
+        int dst = dst_node * node_npes + localrank;
+        if (dst < 0 || dst >= npes) continue;
+        if (rank_used[dst] == token_stamp) continue;
+        rank_used[dst] = token_stamp;
+        mark_rank_experts(map_h, row, expert_num, experts_per_rank, dst, kmax);
+        selected++;
+        break;
+      }
     }
   }
-  if (node_cdf) free(node_cdf);
+  if (rank_used) free(rank_used);
+  if (node_used) free(node_used);
   if (rank_cdf) free(rank_cdf);
 }
 

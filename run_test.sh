@@ -3,11 +3,11 @@
 # NUM_TOKENS_PER_RANK / EXPERT_NUM / HIDDEN_SIZE / TOPK / BLOCKS_PER_KERNEL
 # NNODES / RANKS_PER_NODE / NP / CHUNK_TOKENS
 export NUM_TOKENS_PER_RANK=${NUM_TOKENS_PER_RANK:-4096}
-export EXPERT_NUM=${EXPERT_NUM:-128}
+export EXPERT_NUM=${EXPERT_NUM:-64}
 export HIDDEN_SIZE=${HIDDEN_SIZE:-8192}
-export TOPK=${TOPK:-8}
-export BLOCKS_PER_KERNEL=${BLOCKS_PER_KERNEL:-16}
-export CHUNK_TOKENS=${CHUNK_TOKENS:-32}
+export TOPK=${TOPK:-6}
+export BLOCKS_PER_KERNEL=${BLOCKS_PER_KERNEL:16}
+export CHUNK_TOKENS=${CHUNK_TOKENS:-24}
 # CHUNK_TOKENS 为每个 chunk 的 token 数，影响 flag 数量与流水化重叠程度
 export NNODES=${NNODES:-2}
 export RANKS_PER_NODE=${RANKS_PER_NODE:-8}
@@ -15,7 +15,7 @@ export NP=${NP:-16}
 export SSH_PORT=${SSH_PORT:-2345}
 
 #bench
-export BENCH_ONLY=${BENCH_ONLY:-0}
+export BENCH_ONLY=${BENCH_ONLY:-1}
 export BENCH_ITERS=${BENCH_ITERS:-10}
 export BENCH_WARMUP=${BENCH_WARMUP:-5}
 
@@ -30,7 +30,7 @@ export NVSHMEM_BOOTSTRAP_LIBRARY=/workspace/nvshmem_install/lib/nvshmem_bootstra
   --hostfile hostfile \
   -np "$NP" \
   -x NUM_TOKENS_PER_RANK="$NUM_TOKENS_PER_RANK" \
-  -x ZIPF_ALPHA=0 \
+  -x ZIPF_ALPHA=0.2\
   -x EXPERT_NUM="$EXPERT_NUM" \
   -x HIDDEN_SIZE="$HIDDEN_SIZE" \
   -x TOPK="$TOPK" \
