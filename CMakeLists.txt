@@ -47,7 +47,13 @@ set_target_properties(balance_ep_core PROPERTIES
   INSTALL_RPATH "${NVSHMEM_ROOT}/lib"
 )
 
-add_executable(test_dispatch test/test_dispatch.cu)
+add_executable(test_dispatch
+  test/test_dispatch.cu
+  test/test_dispatch_buffers.cu
+  test/test_dispatch_check.cu
+  test/test_dispatch_env.cu
+  test/test_dispatch_inputs.cu
+)
 target_link_libraries(test_dispatch PRIVATE
   balance_ep_core
 )

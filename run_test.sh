@@ -19,8 +19,6 @@ BENCH_ONLY=${BENCH_ONLY:-0}
 BENCH_ITERS=${BENCH_ITERS:-10}
 BENCH_WARMUP=${BENCH_WARMUP:-5}
 
-#数据偏斜
-ZIPF_ALPHA=${ZIPF_ALPHA:-0}
 
 export NVSHMEM_BOOTSTRAP_LIBRARY=/workspace/nvshmem_install/lib/nvshmem_bootstrap_mpi.so
 
@@ -32,7 +30,7 @@ export NVSHMEM_BOOTSTRAP_LIBRARY=/workspace/nvshmem_install/lib/nvshmem_bootstra
   --hostfile hostfile \
   -np "$NP" \
   -x NUM_TOKENS_PER_RANK="$NUM_TOKENS_PER_RANK" \
-  -x ZIPF_ALPHA="$ZIPF_ALPHA" \
+  -x ZIPF_ALPHA=1 \
   -x EXPERT_NUM="$EXPERT_NUM" \
   -x HIDDEN_SIZE="$HIDDEN_SIZE" \
   -x TOPK="$TOPK" \
@@ -44,7 +42,6 @@ export NVSHMEM_BOOTSTRAP_LIBRARY=/workspace/nvshmem_install/lib/nvshmem_bootstra
   -x BENCH_ITERS="$BENCH_ITERS" \
   -x BENCH_WARMUP="$BENCH_WARMUP" \
   -x NVSHMEM_SYMMETRIC_SIZE=2G \
-  -x NVSHMEM_DEBUG=DEBUG \
   -x NVSHMEM_DISABLE_GDRCOPY=1 \
   /workspace/balance_ep/build/test_dispatch \
   --nnodes "$NNODES" \
