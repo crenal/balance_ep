@@ -130,6 +130,36 @@ static void generate_map(bool *map_h, size_t global_tokens, int num_tokens_per_r
   if (rank_cdf) free(rank_cdf);
 }
 
+static void generate_map_random(bool *map_h, size_t global_tokens, int num_tokens_per_rank, int npes,
+                                int nnodes, int node_npes, int expert_num, int topk, float alpha) {
+  (void)num_tokens_per_rank;
+  (void)npes;
+  (void)nnodes;
+  (void)node_npes;
+  (void)alpha;
+
+  int kmax = topk;
+  if (kmax < 1) kmax = 1;
+  if (kmax > expert_num) kmax = expert_num;
+
+  for (size_t gt = 0; gt < global_tokens; ++gt) {
+    size_t row = gt * (size_t)expert_num;
+    for (int e = 0; e < expert_num; ++e) {
+      map_h[row + (size_t)e] = false;
+    }
+
+    unsigned int state = mix_u32((unsigned int)gt ^ 0xa5a5a5a5u) + 1234u;
+    int filled = 0;
+    while (filled < kmax) {
+      int idx = (int)(next_rand(&state) % (unsigned int)expert_num);
+      if (!map_h[row + (size_t)idx]) {
+        map_h[row + (size_t)idx] = true;
+        filled++;
+      }
+    }
+  }
+}
+
 void init_inputs(TestBuffers *buf, int num_tokens_per_rank, int hidden_size, int mype, int npes,
                  int nnodes, int node_npes, int expert_num, int topk, float alpha,
                  size_t input_bytes, size_t output_bytes, size_t map_bytes) {
@@ -148,7 +178,14 @@ void init_inputs(TestBuffers *buf, int num_tokens_per_rank, int hidden_size, int
   }
 
   size_t global_tokens = (size_t)num_tokens_per_rank * (size_t)npes;
-  generate_map(buf->map_h, global_tokens, num_tokens_per_rank, npes, nnodes, node_npes, expert_num,
-               topk, alpha);
+  const char *random_map_env = getenv("RANDOM_MAP");
+  int use_random_map = (random_map_env && random_map_env[0] != '\0' && atoi(random_map_env) != 0);
+  if (use_random_map) {
+    generate_map_random(buf->map_h, global_tokens, num_tokens_per_rank, npes, nnodes, node_npes,
+                        expert_num, topk, alpha);
+  } else {
+    generate_map(buf->map_h, global_tokens, num_tokens_per_rank, npes, nnodes, node_npes, expert_num,
+                 topk, alpha);
+  }
   cudaMemcpy(buf->routing_map, buf->map_h, map_bytes, cudaMemcpyHostToDevice);
 }

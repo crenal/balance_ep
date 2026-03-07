@@ -162,7 +162,7 @@ int main(int argc, char **argv) {
     cudaEventElapsedTime(&ms, start, stop);
     double sec = ms / 1000.0;
     double bw_gb = (double)local_bytes * (double)bench_iters / sec / 1e9;
-    printf("PE %d: avg_bw %.3f GB/s, iters %d\n", mype, bw_gb, bench_iters);
+    printf("PE %d:data_Size %dMB avg_bw %.3f GB/s, iters %d\n", mype, (int)(local_bytes / 1024 / 1024), bw_gb, bench_iters);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
   }
