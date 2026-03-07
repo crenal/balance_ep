@@ -10,8 +10,8 @@ BLOCKS_PER_KERNEL=${BLOCKS_PER_KERNEL:-16}
 CHUNK_TOKENS=${CHUNK_TOKENS:-32}
 # CHUNK_TOKENS 为每个 chunk 的 token 数，影响 flag 数量与流水化重叠程度
 NNODES=${NNODES:-2}
-RANKS_PER_NODE=${RANKS_PER_NODE:-4}
-NP=${NP:-8}
+RANKS_PER_NODE=${RANKS_PER_NODE:-8}
+NP=${NP:-16}
 SSH_PORT=${SSH_PORT:-2345}
 
 #bench
@@ -20,7 +20,7 @@ BENCH_ITERS=${BENCH_ITERS:-10}
 BENCH_WARMUP=${BENCH_WARMUP:-5}
 
 #数据偏斜
-ZIPF_ALPHA=${ZIPF_ALPHA:-0.5}
+ZIPF_ALPHA=${ZIPF_ALPHA:-0}
 
 export NVSHMEM_BOOTSTRAP_LIBRARY=/workspace/nvshmem_install/lib/nvshmem_bootstrap_mpi.so
 
@@ -44,7 +44,8 @@ export NVSHMEM_BOOTSTRAP_LIBRARY=/workspace/nvshmem_install/lib/nvshmem_bootstra
   -x BENCH_ITERS="$BENCH_ITERS" \
   -x BENCH_WARMUP="$BENCH_WARMUP" \
   -x NVSHMEM_SYMMETRIC_SIZE=2G \
-  -x NVSHMEM_DEBUG=INFO \
+  -x NVSHMEM_DEBUG=DEBUG \
+  -x NVSHMEM_DISABLE_GDRCOPY=1 \
   /workspace/balance_ep/build/test_dispatch \
   --nnodes "$NNODES" \
   --ranks_per_node "$RANKS_PER_NODE"
