@@ -67,6 +67,8 @@ int main(int argc, char **argv) {
   int bench_iters = 0;
   int bench_warmup = 5;
   int bench_only = 0;
+  int use_fast = 0;
+  int dispatch_mode = 0;
   float alpha = 0.0f;
   read_env_int("NUM_TOKENS_PER_RANK", &num_tokens_per_rank);
   read_env_int("EXPERT_NUM", &expert_num);
@@ -77,6 +79,9 @@ int main(int argc, char **argv) {
   read_env_int("BENCH_ITERS", &bench_iters);
   read_env_int("BENCH_WARMUP", &bench_warmup);
   read_env_int("BENCH_ONLY", &bench_only);
+  read_env_int("DISPATCH_FAST", &use_fast);
+  read_env_int("DISPATCH_MODE", &dispatch_mode);
+  if (dispatch_mode == 0 && use_fast) dispatch_mode = 1;
   if (!read_env_float("ALPHA", &alpha)) {
     read_env_float("ZIPF_ALPHA", &alpha);
   }
@@ -134,9 +139,36 @@ int main(int argc, char **argv) {
     nvshmem_finalize();
     return 1;
   }
-  status = pre_process(buf.routing_map, buf.intranode_index, &cfg);
+  const char *mode_name =
+      (dispatch_mode == 2) ? "dispatch_fast" : (dispatch_mode == 1) ? "preprocess_fast" : "dispatch";
+  int (*dispatch_fn)(const void *, void *, const int *, const DispatchConfig *) =
+      dispatch_tokens;
+  int *round_num = nullptr;
+  if (dispatch_mode != 0) {
+    cudaMalloc((void **)&round_num, (size_t)npes * sizeof(int));
+    if (!round_num) {
+      cudaFree(cfg.counts);
+      cudaFree(cfg.offsets);
+      cudaFree(cfg.local_counts);
+      cudaFree(cfg.barrier_counter);
+      cudaFree(cfg.barrier_sense);
+      free_buffers(&buf);
+      nvshmem_finalize();
+      return 1;
+    }
+  }
+  if (dispatch_mode != 0) {
+    status = pre_process_fast(buf.routing_map, buf.intranode_index, round_num, &cfg);
+  } else {
+    status = pre_process(buf.routing_map, buf.intranode_index, &cfg);
+  }
   if (status == 0) {
-    status = dispatch_tokens(buf.input_tokens, buf.output_tokens, buf.intranode_index, &cfg);
+    if (dispatch_mode == 2) {
+      status = dispatch_tokens_fast(buf.input_tokens, buf.output_tokens, buf.intranode_index,
+                                    round_num, &cfg);
+    } else {
+      status = dispatch_fn(buf.input_tokens, buf.output_tokens, buf.intranode_index, &cfg);
+    }
   }
   nvshmem_barrier_all();
 
@@ -148,12 +180,22 @@ int main(int argc, char **argv) {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     for (int i = 0; i < bench_warmup; ++i) {
-      dispatch_tokens(buf.input_tokens, buf.output_tokens, buf.intranode_index, &cfg);
+      if (dispatch_mode == 2) {
+        dispatch_tokens_fast(buf.input_tokens, buf.output_tokens, buf.intranode_index, round_num,
+                             &cfg);
+      } else {
+        dispatch_fn(buf.input_tokens, buf.output_tokens, buf.intranode_index, &cfg);
+      }
       nvshmem_barrier_all();
     }
     cudaEventRecord(start);
     for (int i = 0; i < bench_iters; ++i) {
-      dispatch_tokens(buf.input_tokens, buf.output_tokens, buf.intranode_index, &cfg);
+      if (dispatch_mode == 2) {
+        dispatch_tokens_fast(buf.input_tokens, buf.output_tokens, buf.intranode_index, round_num,
+                             &cfg);
+      } else {
+        dispatch_fn(buf.input_tokens, buf.output_tokens, buf.intranode_index, &cfg);
+      }
       nvshmem_barrier_all();
     }
     cudaEventRecord(stop);
@@ -162,7 +204,8 @@ int main(int argc, char **argv) {
     cudaEventElapsedTime(&ms, start, stop);
     double sec = ms / 1000.0;
     double bw_gb = (double)local_bytes * (double)bench_iters / sec / 1e9;
-    printf("PE %d:data_Size %dMB avg_bw %.3f GB/s, iters %d\n", mype, (int)(local_bytes / 1024 / 1024), bw_gb, bench_iters);
+    printf("PE %d:%s data_Size %dMB avg_bw %.3f GB/s, iters %d\n", mype, mode_name,
+           (int)(local_bytes / 1024 / 1024), bw_gb, bench_iters);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
   }
@@ -172,10 +215,10 @@ int main(int argc, char **argv) {
                  ? 1
                  : check_output(&buf, num_tokens_per_rank, hidden_size, npes, expert_num, mype);
     if (errors != 0) {
-      printf("PE %d: dispatch_tokens failed\n", mype);
+      printf("PE %d: %s failed\n", mype, mode_name);
     }
     else{
-      printf("PE %d: dispatch_tokens passed\n", mype);
+      printf("PE %d: %s passed\n", mype, mode_name);
     }
   }
   cudaFree(cfg.counts);
@@ -183,6 +226,7 @@ int main(int argc, char **argv) {
   cudaFree(cfg.local_counts);
   cudaFree(cfg.barrier_counter);
   cudaFree(cfg.barrier_sense);
+  if (round_num) cudaFree(round_num);
   free_buffers(&buf);
   nvshmem_finalize();
   return errors;

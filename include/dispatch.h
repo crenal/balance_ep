@@ -38,6 +38,12 @@ struct DispatchConfig {
 
 // 根据 routing_map 生成全局 intranode_index
 int pre_process(const bool *routing_map, int *intranode_index, const DispatchConfig *cfg);
+// 根据 routing_map 生成全局 intranode_index（快速实现）
+int pre_process_fast(const bool *routing_map, int *dst_index, int *round_num,
+                     const DispatchConfig *cfg);
 // 按 intranode_index 执行跨 rank dispatch，必要时使用 mid_buf 转发
 int dispatch_tokens(const void *input_tokens, void *output_tokens, const int *intranode_index,
                     const DispatchConfig *cfg);
+// 按 intranode_index 执行跨 rank dispatch（快速实现）
+int dispatch_tokens_fast(const void *input_tokens, void *output_tokens, const int *dst_index,
+                         const int *round_num, const DispatchConfig *cfg);

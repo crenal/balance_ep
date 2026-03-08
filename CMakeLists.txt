@@ -33,7 +33,10 @@ find_package(NVSHMEM REQUIRED CONFIG HINTS "${NVSHMEM_ROOT}/lib/cmake/nvshmem")
 add_library(balance_ep_headers INTERFACE)
 target_include_directories(balance_ep_headers INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-add_library(balance_ep_core src/dispatch.cu)
+add_library(balance_ep_core
+  src/dispatch.cu
+  src/dispatch_fast.cu
+)
 target_link_libraries(balance_ep_core PUBLIC
   balance_ep_headers
   MPI::MPI_CXX
