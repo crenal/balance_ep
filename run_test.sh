@@ -5,9 +5,9 @@
 export NUM_TOKENS_PER_RANK=${NUM_TOKENS_PER_RANK:-4096}
 export EXPERT_NUM=${EXPERT_NUM:-64}
 export HIDDEN_SIZE=${HIDDEN_SIZE:-8192}
-export TOPK=${TOPK:-6}
-export BLOCKS_PER_KERNEL=${BLOCKS_PER_KERNEL:16}
-export CHUNK_TOKENS=${CHUNK_TOKENS:-24}
+export TOPK=${TOPK:-8}
+export BLOCKS_PER_KERNEL=${BLOCKS_PER_KERNEL:-32}
+export CHUNK_TOKENS=${CHUNK_TOKENS:-16}
 # CHUNK_TOKENS 为每个 chunk 的 token 数，影响 flag 数量与流水化重叠程度
 export NNODES=${NNODES:-2}
 export RANKS_PER_NODE=${RANKS_PER_NODE:-8}
@@ -30,7 +30,7 @@ export NVSHMEM_BOOTSTRAP_LIBRARY=/workspace/nvshmem_install/lib/nvshmem_bootstra
   --hostfile hostfile \
   -np "$NP" \
   -x NUM_TOKENS_PER_RANK="$NUM_TOKENS_PER_RANK" \
-  -x ZIPF_ALPHA=0.2\
+  -x ZIPF_ALPHA=0.99\
   -x EXPERT_NUM="$EXPERT_NUM" \
   -x HIDDEN_SIZE="$HIDDEN_SIZE" \
   -x TOPK="$TOPK" \
@@ -42,8 +42,8 @@ export NVSHMEM_BOOTSTRAP_LIBRARY=/workspace/nvshmem_install/lib/nvshmem_bootstra
   -x BENCH_ITERS="$BENCH_ITERS" \
   -x BENCH_WARMUP="$BENCH_WARMUP" \
   -x NVSHMEM_SYMMETRIC_SIZE=2G \
-  -x RANDOM_MAP=1 \
-  -x NVSHMEM_DISABLE_GDRCOPY=1 \
+  -x RANDOM_MAP=0 \
+  -x NVSHMEM_DISABLE_GDRCOPY=0 \
   /workspace/balance_ep/build/test_dispatch \
   --nnodes "$NNODES" \
   --ranks_per_node "$RANKS_PER_NODE"
