@@ -13,7 +13,7 @@ export NNODES=${NNODES:-2}
 export RANKS_PER_NODE=${RANKS_PER_NODE:-8}
 export NP=${NP:-16}
 export SSH_PORT=${SSH_PORT:-2345}
-
+export DISPATCH_MODE=${DISPATCH_MODE:-2}
 #bench
 export BENCH_ONLY=${BENCH_ONLY:-1}
 export BENCH_ITERS=${BENCH_ITERS:-10}
@@ -42,6 +42,7 @@ export NVSHMEM_BOOTSTRAP_LIBRARY=/workspace/nvshmem_install/lib/nvshmem_bootstra
   -x BENCH_ITERS="$BENCH_ITERS" \
   -x BENCH_WARMUP="$BENCH_WARMUP" \
   -x NVSHMEM_SYMMETRIC_SIZE=2G \
+  -x DISPATCH_MODE="$DISPATCH_MODE" \
   -x RANDOM_MAP=0 \
   -x NVSHMEM_DISABLE_GDRCOPY=0 \
   /workspace/balance_ep/build/test_dispatch \
