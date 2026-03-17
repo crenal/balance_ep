@@ -5,7 +5,6 @@
 #include <nvshmem.h>
 #include <nvshmemx.h>
 #include <stddef.h>
-#include <stdlib.h>
 
 namespace cg = cooperative_groups;
 
@@ -257,9 +256,11 @@ __global__ void dispatch_balance_kernel(const void *input_tokens, void *output_t
                                         const int *dst_index, const void *local_buf, int num_tokens,
                                         int hidden_size, int bytes_per_elem, int node_npes, int nnodes,
                                         const void *mid_buf, uint64_t *mid_flags, int chunk_tokens,
+                                        const int *src_forward_local,
                                         const int *src_local_of_forward,
                                         const int *dst_forward_local,
-                                        const int *src_forward_local_of_dst_forward) {
+                                        const int *src_forward_local_of_dst_forward,
+                                        int *barrier_counter, int *barrier_sense) {
   int npes = nvshmem_n_pes();
   if (npes <= 0) return;
   int mype = nvshmem_my_pe();
@@ -269,6 +270,56 @@ __global__ void dispatch_balance_kernel(const void *input_tokens, void *output_t
   int chunk_tokens_local = chunk_tokens > 0 ? chunk_tokens : num_tokens;
   int num_chunks = (num_tokens + chunk_tokens_local - 1) / chunk_tokens_local;
   if (num_chunks <= 0) return;
+
+  if (nnodes > 1) {
+    int src_local = local_rank;
+    int fwd_local = src_forward_local[node_id * node_npes + src_local];
+    int fwd_rank = node_id * node_npes + fwd_local;
+
+    auto warp = cg::tiled_partition<32>(cg::this_thread_block());
+    int warp_id = (threadIdx.x >> 5);
+    int num_warps = (blockDim.x >> 5);
+    for (int t = warp_id + blockIdx.x * num_warps; t < num_tokens; t += gridDim.x * num_warps) {
+      size_t g = (size_t)mype * (size_t)num_tokens + (size_t)t;
+      bool need = false;
+      for (int k = 1; k < nnodes; ++k) {
+        int dst_node = node_id + k;
+        if (dst_node >= nnodes) dst_node -= nnodes;
+        int base_rank = dst_node * node_npes;
+        for (int lr = 0; lr < node_npes; ++lr) {
+          int dst_rank = base_rank + lr;
+          if (dst_rank >= npes) break;
+          int idx = dst_index[g * (size_t)npes + (size_t)dst_rank];
+          if (idx >= 0) {
+            need = true;
+            break;
+          }
+        }
+        if (need) break;
+      }
+      if (!need) continue;
+      size_t offset = (size_t)t * token_bytes;
+      if (fwd_rank == mype) {
+        const uint4 *src = (const uint4 *)((const char *)input_tokens + offset);
+        uint4 *dst = (uint4 *)((char *)local_buf + offset);
+        size_t n = token_bytes / sizeof(uint4);
+        for (size_t i = (size_t)warp.thread_rank(); i < n; i += (size_t)warp.size()) {
+          dst[i] = src[i];
+        }
+      } else {
+        nvshmemx_putmem_warp((char *)local_buf + offset, (const char *)input_tokens + offset,
+                             token_bytes, fwd_rank);
+      }
+    }
+
+    grid_barrier_balance(barrier_counter, barrier_sense, gridDim.x);
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      nvshmem_quiet();
+      nvshmem_barrier_all();
+    }
+    grid_barrier_balance(barrier_counter, barrier_sense, gridDim.x);
+  }
+
   auto tile = cg::tiled_partition<128>(cg::this_thread_block());
   int tile_id = tile.meta_group_rank();
   int tile_count = tile.meta_group_size();
@@ -296,260 +347,408 @@ __global__ void dispatch_balance_kernel(const void *input_tokens, void *output_t
   }
 }
 
-__global__ void gather_balance_kernel(const void *input_tokens, void *local_buf,
-                                      const int *dst_index, int num_tokens, int hidden_size,
-                                      int bytes_per_elem, int node_npes, int nnodes,
-                                      const int *src_forward_local) {
+__device__ __forceinline__ float max2f(float a, float b) { return a > b ? a : b; }
+
+__global__ void compute_src_forward_kernel(const int *counts, const int *node_counts,
+                                           int *src_forward_local, int *src_local_of_forward,
+                                           int node_npes, int nnodes) {
+  if (threadIdx.x != 0) return;
   int npes = nvshmem_n_pes();
   if (npes <= 0) return;
-  int mype = nvshmem_my_pe();
-  int node_id = mype / node_npes;
-  int src_local = mype - node_id * node_npes;
-  int fwd_local = src_forward_local[node_id * node_npes + src_local];
-  int fwd_rank = node_id * node_npes + fwd_local;
-  size_t token_bytes = (size_t)hidden_size * (size_t)bytes_per_elem;
+  int rpn = node_npes;
+  if (rpn < 1 || rpn > 4) return;
+  int node = (int)blockIdx.x;
+  if (node < 0 || node >= nnodes) return;
+  if (node * rpn >= npes) return;
 
-  auto warp = cg::tiled_partition<32>(cg::this_thread_block());
-  int warp_id = (threadIdx.x >> 5);
-  int num_warps = (blockDim.x >> 5);
-  for (int t = warp_id + blockIdx.x * num_warps; t < num_tokens; t += gridDim.x * num_warps) {
-    size_t g = (size_t)mype * (size_t)num_tokens + (size_t)t;
-    bool need = false;
-    for (int k = 1; k < nnodes; ++k) {
-      int dst_node = node_id + k;
-      if (dst_node >= nnodes) dst_node -= nnodes;
-      int base_rank = dst_node * node_npes;
-      for (int lr = 0; lr < node_npes; ++lr) {
-        int dst_rank = base_rank + lr;
-        if (dst_rank >= npes) break;
-        int idx = dst_index[g * (size_t)npes + (size_t)dst_rank];
-        if (idx >= 0) {
-          need = true;
-          break;
+  int weights[4] = {0, 0, 0, 0};
+  int intra_send_base[4] = {0, 0, 0, 0};
+  int intra_recv_base[4] = {0, 0, 0, 0};
+
+  int base_rank = node * rpn;
+  for (int s = 0; s < rpn; ++s) {
+    int src_rank = base_rank + s;
+    int off = 0;
+    for (int b = 0; b < nnodes; ++b) {
+      if (b == node) continue;
+      off += node_counts[src_rank * nnodes + b];
+    }
+    weights[s] = off;
+
+    int send_sum = 0;
+    for (int lr = 0; lr < rpn; ++lr) {
+      if (lr == s) continue;
+      int d = base_rank + lr;
+      if (d < npes) send_sum += counts[src_rank * npes + d];
+    }
+    intra_send_base[s] = send_sum;
+  }
+
+  for (int f = 0; f < rpn; ++f) {
+    int rank = base_rank + f;
+    int recv_sum = 0;
+    for (int s = 0; s < npes; ++s) {
+      if (s == rank) continue;
+      recv_sum += counts[s * npes + rank];
+    }
+    intra_recv_base[f] = recv_sum;
+  }
+
+  float inv_intra = 1.0f / 200.0f;
+  float inv_inter = 1.0f / 50.0f;
+
+  int best_perm[4] = {0, 1, 2, 3};
+  float best_score = -1.0f;
+
+  int perm[4];
+  int used[4];
+  for (int i = 0; i < 4; ++i) used[i] = 0;
+
+  for (int a = 0; a < rpn; ++a) {
+    perm[0] = a;
+    used[a] = 1;
+    if (rpn == 1) {
+      float inter_send_f[4] = {0, 0, 0, 0};
+      float intra_recv_f[4] = {0, 0, 0, 0};
+      float intra_send_s[4] = {0, 0, 0, 0};
+      for (int i = 0; i < rpn; ++i) {
+        inter_send_f[i] = 0.0f;
+        intra_recv_f[i] = (float)intra_recv_base[i];
+        intra_send_s[i] = (float)intra_send_base[i];
+      }
+      for (int s = 0; s < rpn; ++s) {
+        int f = perm[s];
+        int w = weights[s];
+        inter_send_f[f] += (float)w;
+        if (f != s) {
+          intra_recv_f[f] += (float)w;
+          intra_send_s[s] += (float)w;
         }
       }
-      if (need) break;
-    }
-    if (!need) continue;
-    size_t offset = (size_t)t * token_bytes;
-    if (fwd_rank == mype) {
-      const uint4 *src = (const uint4 *)((const char *)input_tokens + offset);
-      uint4 *dst = (uint4 *)((char *)local_buf + offset);
-      size_t n = token_bytes / sizeof(uint4);
-      for (size_t i = (size_t)warp.thread_rank(); i < n; i += (size_t)warp.size()) {
-        dst[i] = src[i];
+      float score = 0.0f;
+      for (int f = 0; f < rpn; ++f) {
+        score = max2f(score, inter_send_f[f] * inv_inter);
+        score = max2f(score, intra_recv_f[f] * inv_intra);
       }
-    } else {
-      nvshmemx_putmem_warp((char *)local_buf + offset, (const char *)input_tokens + offset,
-                           token_bytes, fwd_rank);
+      for (int s = 0; s < rpn; ++s) {
+        score = max2f(score, intra_send_s[s] * inv_intra);
+      }
+      if (best_score < 0.0f || score < best_score) {
+        best_score = score;
+        for (int i = 0; i < 4; ++i) best_perm[i] = perm[i];
+      }
+      used[a] = 0;
+      continue;
     }
+    for (int b = 0; b < rpn; ++b) {
+      if (used[b]) continue;
+      perm[1] = b;
+      used[b] = 1;
+      if (rpn == 2) {
+        float inter_send_f[4] = {0, 0, 0, 0};
+        float intra_recv_f[4] = {0, 0, 0, 0};
+        float intra_send_s[4] = {0, 0, 0, 0};
+        for (int i = 0; i < rpn; ++i) {
+          inter_send_f[i] = 0.0f;
+          intra_recv_f[i] = (float)intra_recv_base[i];
+          intra_send_s[i] = (float)intra_send_base[i];
+        }
+        for (int s = 0; s < rpn; ++s) {
+          int f = perm[s];
+          int w = weights[s];
+          inter_send_f[f] += (float)w;
+          if (f != s) {
+            intra_recv_f[f] += (float)w;
+            intra_send_s[s] += (float)w;
+          }
+        }
+        float score = 0.0f;
+        for (int f = 0; f < rpn; ++f) {
+          score = max2f(score, inter_send_f[f] * inv_inter);
+          score = max2f(score, intra_recv_f[f] * inv_intra);
+        }
+        for (int s = 0; s < rpn; ++s) {
+          score = max2f(score, intra_send_s[s] * inv_intra);
+        }
+        if (best_score < 0.0f || score < best_score) {
+          best_score = score;
+          for (int i = 0; i < 4; ++i) best_perm[i] = perm[i];
+        }
+        used[b] = 0;
+        continue;
+      }
+      for (int c = 0; c < rpn; ++c) {
+        if (used[c]) continue;
+        perm[2] = c;
+        used[c] = 1;
+        if (rpn == 3) {
+          float inter_send_f[4] = {0, 0, 0, 0};
+          float intra_recv_f[4] = {0, 0, 0, 0};
+          float intra_send_s[4] = {0, 0, 0, 0};
+          for (int i = 0; i < rpn; ++i) {
+            inter_send_f[i] = 0.0f;
+            intra_recv_f[i] = (float)intra_recv_base[i];
+            intra_send_s[i] = (float)intra_send_base[i];
+          }
+          for (int s = 0; s < rpn; ++s) {
+            int f = perm[s];
+            int w = weights[s];
+            inter_send_f[f] += (float)w;
+            if (f != s) {
+              intra_recv_f[f] += (float)w;
+              intra_send_s[s] += (float)w;
+            }
+          }
+          float score = 0.0f;
+          for (int f = 0; f < rpn; ++f) {
+            score = max2f(score, inter_send_f[f] * inv_inter);
+            score = max2f(score, intra_recv_f[f] * inv_intra);
+          }
+          for (int s = 0; s < rpn; ++s) {
+            score = max2f(score, intra_send_s[s] * inv_intra);
+          }
+          if (best_score < 0.0f || score < best_score) {
+            best_score = score;
+            for (int i = 0; i < 4; ++i) best_perm[i] = perm[i];
+          }
+          used[c] = 0;
+          continue;
+        }
+        for (int d = 0; d < rpn; ++d) {
+          if (used[d]) continue;
+          perm[3] = d;
+
+          float inter_send_f[4] = {0, 0, 0, 0};
+          float intra_recv_f[4] = {0, 0, 0, 0};
+          float intra_send_s[4] = {0, 0, 0, 0};
+          for (int i = 0; i < rpn; ++i) {
+            inter_send_f[i] = 0.0f;
+            intra_recv_f[i] = (float)intra_recv_base[i];
+            intra_send_s[i] = (float)intra_send_base[i];
+          }
+          for (int s = 0; s < rpn; ++s) {
+            int f = perm[s];
+            int w = weights[s];
+            inter_send_f[f] += (float)w;
+            if (f != s) {
+              intra_recv_f[f] += (float)w;
+              intra_send_s[s] += (float)w;
+            }
+          }
+          float score = 0.0f;
+          for (int f = 0; f < rpn; ++f) {
+            score = max2f(score, inter_send_f[f] * inv_inter);
+            score = max2f(score, intra_recv_f[f] * inv_intra);
+          }
+          for (int s = 0; s < rpn; ++s) {
+            score = max2f(score, intra_send_s[s] * inv_intra);
+          }
+          if (best_score < 0.0f || score < best_score) {
+            best_score = score;
+            for (int i = 0; i < 4; ++i) best_perm[i] = perm[i];
+          }
+        }
+        used[c] = 0;
+      }
+      used[b] = 0;
+    }
+    used[a] = 0;
+  }
+
+  for (int i = 0; i < rpn; ++i) {
+    src_forward_local[base_rank + i] = best_perm[i];
+  }
+  for (int i = 0; i < rpn; ++i) {
+    int f = best_perm[i];
+    src_local_of_forward[base_rank + f] = i;
   }
 }
 
-static void compute_balance_maps_host(int npes, int node_npes, int nnodes, const int *counts_h,
-                                      const int *node_counts_h, int *src_forward_local_h,
-                                      int *src_local_of_forward_h, int *dst_forward_local_h,
-                                      int *src_forward_local_of_dst_forward_h) {
-  const double inv_intra = 1.0 / 200.0;
-  const double inv_inter = 1.0 / 50.0;
+__global__ void compute_dst_forward_kernel(const int *counts, const int *node_counts,
+                                           const int *src_local_of_forward, int *dst_forward_local,
+                                           int *src_forward_local_of_dst_forward, int node_npes,
+                                           int nnodes) {
+  if (threadIdx.x != 0) return;
+  int npes = nvshmem_n_pes();
+  if (npes <= 0) return;
+  int rpn = node_npes;
+  if (rpn < 1 || rpn > 4) return;
+  int b = (int)blockIdx.x;
+  if (b < 0 || b >= nnodes) return;
+  if (b * rpn >= npes) return;
 
-  int nodes = nnodes > 0 ? nnodes : 1;
-  int rpn = node_npes > 0 ? node_npes : npes;
+  float inv_intra = 1.0f / 200.0f;
+  float inv_inter = 1.0f / 50.0f;
 
-  for (int n = 0; n < nodes; ++n) {
-    for (int i = 0; i < rpn; ++i) {
-      src_forward_local_h[n * rpn + i] = i;
-      src_local_of_forward_h[n * rpn + i] = i;
+  int base_rank = b * rpn;
+  float intra_send[4] = {0, 0, 0, 0};
+  float inter_recv[4] = {0, 0, 0, 0};
+  for (int j = 0; j < rpn; ++j) {
+    int dst_rank = base_rank + j;
+    int send_sum = 0;
+    for (int lr = 0; lr < rpn; ++lr) {
+      if (lr == j) continue;
+      int d = base_rank + lr;
+      if (d < npes) send_sum += counts[dst_rank * npes + d];
     }
-  }
-  for (int a = 0; a < nodes; ++a) {
-    for (int b = 0; b < nodes; ++b) {
-      for (int f = 0; f < rpn; ++f) {
-        dst_forward_local_h[(a * nodes + b) * rpn + f] = f;
-        src_forward_local_of_dst_forward_h[(a * nodes + b) * rpn + f] = f;
-      }
-    }
+    intra_send[j] = (float)send_sum;
+    inter_recv[j] = 0.0f;
   }
 
-  int *intra_send = (int *)malloc((size_t)npes * sizeof(int));
-  int *intra_recv = (int *)malloc((size_t)npes * sizeof(int));
-  int *inter_send = (int *)malloc((size_t)npes * sizeof(int));
-  int *inter_recv = (int *)malloc((size_t)npes * sizeof(int));
-  int *dist_total = (int *)malloc((size_t)npes * (size_t)nodes * sizeof(int));
-  if (!intra_send || !intra_recv || !inter_send || !inter_recv || !dist_total) {
-    if (intra_send) free(intra_send);
-    if (intra_recv) free(intra_recv);
-    if (inter_send) free(inter_send);
-    if (inter_recv) free(inter_recv);
-    if (dist_total) free(dist_total);
-    return;
+  for (int f = 0; f < rpn; ++f) {
+    dst_forward_local[(b * nnodes + b) * rpn + f] = f;
+    src_forward_local_of_dst_forward[(b * nnodes + b) * rpn + f] = f;
   }
 
-  for (int r = 0; r < npes; ++r) {
-    intra_send[r] = 0;
-    intra_recv[r] = 0;
-    inter_send[r] = 0;
-    inter_recv[r] = 0;
-  }
-  for (int s = 0; s < npes; ++s) {
-    int snode = s / rpn;
-    for (int b = 0; b < nodes; ++b) {
-      int sum = 0;
-      int base_rank = b * rpn;
+  for (int a = 0; a < nnodes; ++a) {
+    if (a == b) continue;
+    if (a * rpn >= npes) continue;
+
+    int w_f[4] = {0, 0, 0, 0};
+    int src_rank_f[4] = {0, 0, 0, 0};
+    int dist_f[4] = {0, 0, 0, 0};
+    for (int f = 0; f < rpn; ++f) {
+      int s = src_local_of_forward[a * rpn + f];
+      int src_rank = a * rpn + s;
+      src_rank_f[f] = src_rank;
+      w_f[f] = node_counts[src_rank * nnodes + b];
+      int dist = 0;
       for (int lr = 0; lr < rpn; ++lr) {
         int d = base_rank + lr;
-        if (d >= npes) break;
-        sum += counts_h[s * npes + d];
-        if (b == snode && d != s) {
-          intra_send[s] += counts_h[s * npes + d];
-        }
+        if (d < npes) dist += counts[src_rank * npes + d];
       }
-      dist_total[s * nodes + b] = sum;
+      dist_f[f] = dist;
     }
-  }
-  for (int d = 0; d < npes; ++d) {
-    int sum = 0;
-    for (int s = 0; s < npes; ++s) {
-      if (s == d) continue;
-      sum += counts_h[s * npes + d];
-    }
-    intra_recv[d] = sum;
-  }
 
-  for (int n = 0; n < nodes; ++n) {
-    int used_fwd[64];
-    int weights[64];
-    int order[64];
-    int m = rpn;
-    if (m > 64) m = 64;
-    for (int i = 0; i < m; ++i) {
-      used_fwd[i] = 0;
-      int src_rank = n * rpn + i;
-      int off = 0;
-      for (int b = 0; b < nodes; ++b) {
-        if (b == n) continue;
-        off += node_counts_h[src_rank * nodes + b];
-      }
-      weights[i] = off;
-      order[i] = i;
-    }
-    for (int i = 0; i < m; ++i) {
-      int best = i;
-      for (int j = i + 1; j < m; ++j) {
-        if (weights[order[j]] > weights[order[best]]) best = j;
-      }
-      int tmp = order[i];
-      order[i] = order[best];
-      order[best] = tmp;
-    }
-    for (int pi = 0; pi < m; ++pi) {
-      int s = order[pi];
-      int best_f = -1;
-      double best_score = 0.0;
-      for (int f = 0; f < m; ++f) {
-        if (used_fwd[f]) continue;
-        int src_rank = n * rpn + s;
-        int f_rank = n * rpn + f;
-        int w = weights[s];
-        int add_intra = (f == s) ? 0 : w;
-        double a = ((double)(inter_send[f_rank] + w)) * inv_inter;
-        double b = ((double)(intra_recv[f_rank] + add_intra)) * inv_intra;
-        double c = ((double)(intra_send[src_rank] + add_intra)) * inv_intra;
-        double score = a;
-        if (b > score) score = b;
-        if (c > score) score = c;
-        if (best_f < 0 || score < best_score) {
-          best_f = f;
-          best_score = score;
-        }
-      }
-      if (best_f < 0) best_f = s;
-      used_fwd[best_f] = 1;
-      src_forward_local_h[n * rpn + s] = best_f;
-      src_local_of_forward_h[n * rpn + best_f] = s;
-      int src_rank = n * rpn + s;
-      int f_rank = n * rpn + best_f;
-      inter_send[f_rank] += weights[s];
-      if (best_f != s) {
-        intra_send[src_rank] += weights[s];
-        intra_recv[f_rank] += weights[s];
-      }
-    }
-  }
+    int best_perm[4] = {0, 1, 2, 3};
+    float best_score = -1.0f;
 
-  for (int a = 0; a < nodes; ++a) {
-    for (int b = 0; b < nodes; ++b) {
-      if (a == b) continue;
-      int used_dst[64];
-      int order[64];
-      int m = rpn;
-      if (m > 64) m = 64;
-      for (int i = 0; i < m; ++i) {
-        used_dst[i] = 0;
-        order[i] = i;
-      }
-      for (int i = 0; i < m; ++i) {
-        int best = i;
-        for (int j = i + 1; j < m; ++j) {
-          int f1 = order[j];
-          int f0 = order[best];
-          int s1 = src_local_of_forward_h[a * rpn + f1];
-          int s0 = src_local_of_forward_h[a * rpn + f0];
-          int r1 = a * rpn + s1;
-          int r0 = a * rpn + s0;
-          int w1 = node_counts_h[r1 * nodes + b];
-          int w0 = node_counts_h[r0 * nodes + b];
-          int d1 = dist_total[r1 * nodes + b];
-          int d0 = dist_total[r0 * nodes + b];
-          int k1 = w1 * 4 + d1;
-          int k0 = w0 * 4 + d0;
-          if (k1 > k0) best = j;
-        }
-        int tmp = order[i];
-        order[i] = order[best];
-        order[best] = tmp;
-      }
-      for (int pi = 0; pi < m; ++pi) {
-        int f = order[pi];
-        int s = src_local_of_forward_h[a * rpn + f];
-        int src_rank = a * rpn + s;
-        int w = node_counts_h[src_rank * nodes + b];
-        int dist = dist_total[src_rank * nodes + b];
-        int best_j = -1;
-        double best_score = 0.0;
-        for (int j = 0; j < m; ++j) {
-          if (used_dst[j]) continue;
-          int dst_rank = b * rpn + j;
-          int self_cnt = counts_h[src_rank * npes + dst_rank];
-          int add_intra = dist - self_cnt;
-          if (add_intra < 0) add_intra = 0;
-          double a1 = ((double)(inter_recv[dst_rank] + w)) * inv_inter;
-          double b1 = ((double)(intra_send[dst_rank] + add_intra)) * inv_intra;
-          double score = a1 > b1 ? a1 : b1;
-          if (best_j < 0 || score < best_score) {
-            best_j = j;
-            best_score = score;
-          }
-        }
-        if (best_j < 0) best_j = f;
-        used_dst[best_j] = 1;
-        dst_forward_local_h[(a * nodes + b) * rpn + f] = best_j;
-        src_forward_local_of_dst_forward_h[(a * nodes + b) * rpn + best_j] = f;
-        int dst_rank = b * rpn + best_j;
-        int self_cnt = counts_h[src_rank * npes + dst_rank];
-        int add_intra = dist - self_cnt;
+    int perm[4];
+    int used[4];
+    for (int i = 0; i < 4; ++i) used[i] = 0;
+
+    for (int p0 = 0; p0 < rpn; ++p0) {
+      perm[0] = p0;
+      used[p0] = 1;
+      if (rpn == 1) {
+        float tmp_inter[4] = {inter_recv[0], 0, 0, 0};
+        float tmp_intra[4] = {intra_send[0], 0, 0, 0};
+        int j = perm[0];
+        int src_rank = src_rank_f[0];
+        int dst_rank = base_rank + j;
+        int self_cnt = counts[src_rank * npes + dst_rank];
+        int add_intra = dist_f[0] - self_cnt;
         if (add_intra < 0) add_intra = 0;
-        inter_recv[dst_rank] += w;
-        intra_send[dst_rank] += add_intra;
+        tmp_inter[j] += (float)w_f[0];
+        tmp_intra[j] += (float)add_intra;
+        float score = max2f(tmp_inter[0] * inv_inter, tmp_intra[0] * inv_intra);
+        if (best_score < 0.0f || score < best_score) {
+          best_score = score;
+          for (int i = 0; i < 4; ++i) best_perm[i] = perm[i];
+        }
+        used[p0] = 0;
+        continue;
       }
+      for (int p1 = 0; p1 < rpn; ++p1) {
+        if (used[p1]) continue;
+        perm[1] = p1;
+        used[p1] = 1;
+        if (rpn == 2) {
+          float tmp_inter[4] = {inter_recv[0], inter_recv[1], 0, 0};
+          float tmp_intra[4] = {intra_send[0], intra_send[1], 0, 0};
+          for (int f = 0; f < rpn; ++f) {
+            int j = perm[f];
+            int src_rank = src_rank_f[f];
+            int dst_rank = base_rank + j;
+            int self_cnt = counts[src_rank * npes + dst_rank];
+            int add_intra = dist_f[f] - self_cnt;
+            if (add_intra < 0) add_intra = 0;
+            tmp_inter[j] += (float)w_f[f];
+            tmp_intra[j] += (float)add_intra;
+          }
+          float score = 0.0f;
+          for (int j = 0; j < rpn; ++j) {
+            score = max2f(score, max2f(tmp_inter[j] * inv_inter, tmp_intra[j] * inv_intra));
+          }
+          if (best_score < 0.0f || score < best_score) {
+            best_score = score;
+            for (int i = 0; i < 4; ++i) best_perm[i] = perm[i];
+          }
+          used[p1] = 0;
+          continue;
+        }
+        for (int p2 = 0; p2 < rpn; ++p2) {
+          if (used[p2]) continue;
+          perm[2] = p2;
+          used[p2] = 1;
+          if (rpn == 3) {
+            float tmp_inter[4] = {inter_recv[0], inter_recv[1], inter_recv[2], 0};
+            float tmp_intra[4] = {intra_send[0], intra_send[1], intra_send[2], 0};
+            for (int f = 0; f < rpn; ++f) {
+              int j = perm[f];
+              int src_rank = src_rank_f[f];
+              int dst_rank = base_rank + j;
+              int self_cnt = counts[src_rank * npes + dst_rank];
+              int add_intra = dist_f[f] - self_cnt;
+              if (add_intra < 0) add_intra = 0;
+              tmp_inter[j] += (float)w_f[f];
+              tmp_intra[j] += (float)add_intra;
+            }
+            float score = 0.0f;
+            for (int j = 0; j < rpn; ++j) {
+              score = max2f(score, max2f(tmp_inter[j] * inv_inter, tmp_intra[j] * inv_intra));
+            }
+            if (best_score < 0.0f || score < best_score) {
+              best_score = score;
+              for (int i = 0; i < 4; ++i) best_perm[i] = perm[i];
+            }
+            used[p2] = 0;
+            continue;
+          }
+          for (int p3 = 0; p3 < rpn; ++p3) {
+            if (used[p3]) continue;
+            perm[3] = p3;
+            float tmp_inter[4] = {inter_recv[0], inter_recv[1], inter_recv[2], inter_recv[3]};
+            float tmp_intra[4] = {intra_send[0], intra_send[1], intra_send[2], intra_send[3]};
+            for (int f = 0; f < rpn; ++f) {
+              int j = perm[f];
+              int src_rank = src_rank_f[f];
+              int dst_rank = base_rank + j;
+              int self_cnt = counts[src_rank * npes + dst_rank];
+              int add_intra = dist_f[f] - self_cnt;
+              if (add_intra < 0) add_intra = 0;
+              tmp_inter[j] += (float)w_f[f];
+              tmp_intra[j] += (float)add_intra;
+            }
+            float score = 0.0f;
+            for (int j = 0; j < rpn; ++j) {
+              score = max2f(score, max2f(tmp_inter[j] * inv_inter, tmp_intra[j] * inv_intra));
+            }
+            if (best_score < 0.0f || score < best_score) {
+              best_score = score;
+              for (int i = 0; i < 4; ++i) best_perm[i] = perm[i];
+            }
+          }
+          used[p2] = 0;
+        }
+        used[p1] = 0;
+      }
+      used[p0] = 0;
+    }
+
+    for (int f = 0; f < rpn; ++f) {
+      int j = best_perm[f];
+      int src_rank = src_rank_f[f];
+      int dst_rank = base_rank + j;
+      int self_cnt = counts[src_rank * npes + dst_rank];
+      int add_intra = dist_f[f] - self_cnt;
+      if (add_intra < 0) add_intra = 0;
+      dst_forward_local[(a * nnodes + b) * rpn + f] = j;
+      src_forward_local_of_dst_forward[(a * nnodes + b) * rpn + j] = f;
+      inter_recv[j] += (float)w_f[f];
+      intra_send[j] += (float)add_intra;
     }
   }
-
-  free(intra_send);
-  free(intra_recv);
-  free(inter_send);
-  free(inter_recv);
-  free(dist_total);
 }
 
 int pre_process_balance(const bool *routing_map, int *dst_index, const DispatchConfig *cfg) {
@@ -604,50 +803,21 @@ int pre_process_balance(const bool *routing_map, int *dst_index, const DispatchC
   err = cudaDeviceSynchronize();
   if (err != cudaSuccess) return 1;
 
-  int *counts_h = (int *)malloc((size_t)npes * (size_t)npes * sizeof(int));
-  int *node_counts_h = (int *)malloc((size_t)npes * (size_t)nnodes * sizeof(int));
-  int *src_forward_local_h = (int *)malloc((size_t)nnodes * (size_t)node_npes * sizeof(int));
-  int *src_local_of_forward_h = (int *)malloc((size_t)nnodes * (size_t)node_npes * sizeof(int));
-  int *dst_forward_local_h =
-      (int *)malloc((size_t)nnodes * (size_t)nnodes * (size_t)node_npes * sizeof(int));
-  int *src_forward_local_of_dst_forward_h =
-      (int *)malloc((size_t)nnodes * (size_t)nnodes * (size_t)node_npes * sizeof(int));
-  if (!counts_h || !node_counts_h || !src_forward_local_h || !src_local_of_forward_h ||
-      !dst_forward_local_h || !src_forward_local_of_dst_forward_h) {
-    if (counts_h) free(counts_h);
-    if (node_counts_h) free(node_counts_h);
-    if (src_forward_local_h) free(src_forward_local_h);
-    if (src_local_of_forward_h) free(src_local_of_forward_h);
-    if (dst_forward_local_h) free(dst_forward_local_h);
-    if (src_forward_local_of_dst_forward_h) free(src_forward_local_of_dst_forward_h);
-    return 1;
-  }
+  if (node_npes < 1 || node_npes > 4) return 1;
 
-  cudaMemcpy(counts_h, counts, (size_t)npes * (size_t)npes * sizeof(int), cudaMemcpyDeviceToHost);
-  cudaMemcpy(node_counts_h, node_counts, (size_t)npes * (size_t)nnodes * sizeof(int),
-             cudaMemcpyDeviceToHost);
+  compute_src_forward_kernel<<<nnodes, 1>>>(counts, node_counts, src_forward_local,
+                                            src_local_of_forward, node_npes, nnodes);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return 1;
 
-  compute_balance_maps_host(npes, node_npes, nnodes, counts_h, node_counts_h, src_forward_local_h,
-                            src_local_of_forward_h, dst_forward_local_h,
-                            src_forward_local_of_dst_forward_h);
+  compute_dst_forward_kernel<<<nnodes, 1>>>(counts, node_counts, src_local_of_forward,
+                                            dst_forward_local, src_forward_local_of_dst_forward,
+                                            node_npes, nnodes);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return 1;
 
-  cudaMemcpy(src_forward_local, src_forward_local_h,
-             (size_t)nnodes * (size_t)node_npes * sizeof(int), cudaMemcpyHostToDevice);
-  cudaMemcpy(src_local_of_forward, src_local_of_forward_h,
-             (size_t)nnodes * (size_t)node_npes * sizeof(int), cudaMemcpyHostToDevice);
-  cudaMemcpy(dst_forward_local, dst_forward_local_h,
-             (size_t)nnodes * (size_t)nnodes * (size_t)node_npes * sizeof(int),
-             cudaMemcpyHostToDevice);
-  cudaMemcpy(src_forward_local_of_dst_forward, src_forward_local_of_dst_forward_h,
-             (size_t)nnodes * (size_t)nnodes * (size_t)node_npes * sizeof(int),
-             cudaMemcpyHostToDevice);
-
-  free(counts_h);
-  free(node_counts_h);
-  free(src_forward_local_h);
-  free(src_local_of_forward_h);
-  free(dst_forward_local_h);
-  free(src_forward_local_of_dst_forward_h);
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) return 1;
   return 0;
 }
 
@@ -668,36 +838,30 @@ int dispatch_tokens_balance(const void *input_tokens, void *output_tokens, const
   const void *mid_buf = cfg->mid_buf;
   uint64_t *mid_flags = cfg->mid_flags;
   void *local_buf = cfg->local_buf;
+  int *barrier_counter = cfg->barrier_counter;
+  int *barrier_sense = cfg->barrier_sense;
   const int *src_forward_local = cfg->src_forward_local;
   const int *src_local_of_forward = cfg->src_local_of_forward;
   const int *dst_forward_local = cfg->dst_forward_local;
   const int *src_forward_local_of_dst_forward = cfg->src_forward_local_of_dst_forward;
   if (!input_tokens || !output_tokens || !dst_index || !local_buf || !src_forward_local ||
-      !src_local_of_forward || !dst_forward_local || !src_forward_local_of_dst_forward) {
+      !src_local_of_forward || !dst_forward_local || !src_forward_local_of_dst_forward ||
+      !barrier_counter || !barrier_sense) {
     return 1;
   }
 
   int threads = 256;
-  int blocks_gather = (num_tokens + (threads / 32) - 1) / (threads / 32);
-  if (blocks_gather > 4096) blocks_gather = 4096;
-  gather_balance_kernel<<<blocks_gather, threads>>>(input_tokens, local_buf, dst_index, num_tokens,
-                                                    hidden_size, bytes_per_elem, node_npes, nnodes,
-                                                    src_forward_local);
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) return 1;
-  err = cudaDeviceSynchronize();
-  if (err != cudaSuccess) return 1;
-  nvshmem_quiet();
-  nvshmem_barrier_all();
-
   int blocks = (num_tokens + threads - 1) / threads;
   if (cfg->blocks_per_kernel > 0) blocks = cfg->blocks_per_kernel;
-  dispatch_balance_kernel<<<blocks, threads>>>(input_tokens, output_tokens, dst_index, local_buf,
-                                               num_tokens, hidden_size, bytes_per_elem, node_npes,
-                                               nnodes, mid_buf, mid_flags, chunk_tokens,
-                                               src_local_of_forward, dst_forward_local,
-                                               src_forward_local_of_dst_forward);
-  err = cudaGetLastError();
+
+  cudaMemset(barrier_counter, 0, sizeof(int));
+  cudaMemset(barrier_sense, 0, sizeof(int));
+
+  dispatch_balance_kernel<<<blocks, threads>>>(
+      input_tokens, output_tokens, dst_index, local_buf, num_tokens, hidden_size, bytes_per_elem,
+      node_npes, nnodes, mid_buf, mid_flags, chunk_tokens, src_forward_local, src_local_of_forward,
+      dst_forward_local, src_forward_local_of_dst_forward, barrier_counter, barrier_sense);
+  cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) return 1;
   err = cudaDeviceSynchronize();
   if (err != cudaSuccess) return 1;
