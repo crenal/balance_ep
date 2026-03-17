@@ -34,6 +34,13 @@ struct DispatchConfig {
   int *barrier_counter;
   // 设备侧网格同步翻转位
   int *barrier_sense;
+
+  void *local_buf;
+  int *node_counts;
+  int *src_forward_local;
+  int *src_local_of_forward;
+  int *dst_forward_local;
+  int *src_forward_local_of_dst_forward;
 };
 
 // 根据 routing_map 生成全局 intranode_index
@@ -47,3 +54,8 @@ int dispatch_tokens(const void *input_tokens, void *output_tokens, const int *in
 // 按 intranode_index 执行跨 rank dispatch（快速实现）
 int dispatch_tokens_fast(const void *input_tokens, void *output_tokens, const int *dst_index,
                          const int *round_num, const DispatchConfig *cfg);
+
+int pre_process_balance(const bool *routing_map, int *dst_index, const DispatchConfig *cfg);
+
+int dispatch_tokens_balance(const void *input_tokens, void *output_tokens, const int *dst_index,
+                            const DispatchConfig *cfg);

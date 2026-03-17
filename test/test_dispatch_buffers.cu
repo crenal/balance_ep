@@ -16,6 +16,8 @@ int allocate_buffers(TestBuffers *buf, size_t input_bytes, size_t output_bytes, 
   cudaMalloc((void **)&buf->routing_map, map_bytes);
   buf->intranode_index = nullptr;
   cudaMalloc((void **)&buf->intranode_index, intranode_elems * sizeof(int));
+  buf->local_buf_bytes = input_bytes;
+  buf->local_buf = buf->local_buf_bytes ? nvshmem_malloc(buf->local_buf_bytes) : nullptr;
   buf->mid_buf_bytes = mid_buf_bytes;
   buf->mid_flags_bytes = mid_flags_bytes;
   printf("start allocate mid_buf %p, mid_flags %p\n", buf->mid_buf, buf->mid_flags);
@@ -27,6 +29,7 @@ int allocate_buffers(TestBuffers *buf, size_t input_bytes, size_t output_bytes, 
   buf->output_h = (float *)malloc(output_bytes);
   buf->map_h = (bool *)malloc(map_bytes);
   if (!buf->input_tokens || !buf->output_tokens || !buf->routing_map || !buf->intranode_index ||
+      (buf->local_buf_bytes > 0 && !buf->local_buf) ||
       (buf->mid_buf_bytes > 0 && !buf->mid_buf) || (buf->mid_flags_bytes > 0 && !buf->mid_flags) ||
       !buf->input_h || !buf->output_h || !buf->map_h) {
     return 1;
@@ -40,6 +43,7 @@ void free_buffers(TestBuffers *buf) {
   if (buf->map_h) free(buf->map_h);
   if (buf->input_tokens) nvshmem_free(buf->input_tokens);
   if (buf->output_tokens) nvshmem_free(buf->output_tokens);
+  if (buf->local_buf) nvshmem_free(buf->local_buf);
   if (buf->mid_buf) nvshmem_free(buf->mid_buf);
   if (buf->mid_flags) nvshmem_free(buf->mid_flags);
   if (buf->routing_map) cudaFree(buf->routing_map);

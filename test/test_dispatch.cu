@@ -121,6 +121,7 @@ int main(int argc, char **argv) {
   cfg.chunk_tokens = chunk_tokens;
   cfg.node_npes = node_npes;
   cfg.nnodes = nnodes;
+  cfg.local_buf = buf.local_buf;
   cfg.mid_buf = buf.mid_buf;
   cfg.mid_flags = buf.mid_flags;
   cudaMalloc((void **)&cfg.counts, (size_t)npes * (size_t)npes * sizeof(int));
@@ -128,23 +129,47 @@ int main(int argc, char **argv) {
   cudaMalloc((void **)&cfg.local_counts, (size_t)npes * (size_t)npes * sizeof(int));
   cudaMalloc((void **)&cfg.barrier_counter, sizeof(int));
   cudaMalloc((void **)&cfg.barrier_sense, sizeof(int));
-  if (!cfg.counts || !cfg.offsets || !cfg.local_counts || !cfg.barrier_counter ||
-      !cfg.barrier_sense) {
+  cfg.node_counts = nullptr;
+  cfg.src_forward_local = nullptr;
+  cfg.src_local_of_forward = nullptr;
+  cfg.dst_forward_local = nullptr;
+  cfg.src_forward_local_of_dst_forward = nullptr;
+  if (dispatch_mode == 3) {
+    cudaMalloc((void **)&cfg.node_counts, (size_t)npes * (size_t)nnodes * sizeof(int));
+    cudaMalloc((void **)&cfg.src_forward_local, (size_t)nnodes * (size_t)node_npes * sizeof(int));
+    cudaMalloc((void **)&cfg.src_local_of_forward, (size_t)nnodes * (size_t)node_npes * sizeof(int));
+    cudaMalloc((void **)&cfg.dst_forward_local,
+               (size_t)nnodes * (size_t)nnodes * (size_t)node_npes * sizeof(int));
+    cudaMalloc((void **)&cfg.src_forward_local_of_dst_forward,
+               (size_t)nnodes * (size_t)nnodes * (size_t)node_npes * sizeof(int));
+  }
+  if (!cfg.counts || !cfg.offsets || !cfg.local_counts || !cfg.barrier_counter || !cfg.barrier_sense ||
+      (dispatch_mode == 3 &&
+       (!cfg.node_counts || !cfg.src_forward_local || !cfg.src_local_of_forward || !cfg.dst_forward_local ||
+        !cfg.src_forward_local_of_dst_forward))) {
     if (cfg.counts) cudaFree(cfg.counts);
     if (cfg.offsets) cudaFree(cfg.offsets);
     if (cfg.local_counts) cudaFree(cfg.local_counts);
     if (cfg.barrier_counter) cudaFree(cfg.barrier_counter);
     if (cfg.barrier_sense) cudaFree(cfg.barrier_sense);
+    if (cfg.node_counts) cudaFree(cfg.node_counts);
+    if (cfg.src_forward_local) cudaFree(cfg.src_forward_local);
+    if (cfg.src_local_of_forward) cudaFree(cfg.src_local_of_forward);
+    if (cfg.dst_forward_local) cudaFree(cfg.dst_forward_local);
+    if (cfg.src_forward_local_of_dst_forward) cudaFree(cfg.src_forward_local_of_dst_forward);
     free_buffers(&buf);
     nvshmem_finalize();
     return 1;
   }
   const char *mode_name =
-      (dispatch_mode == 2) ? "dispatch_fast" : (dispatch_mode == 1) ? "preprocess_fast" : "dispatch";
+      (dispatch_mode == 3)   ? "dispatch_balance"
+      : (dispatch_mode == 2) ? "dispatch_fast"
+      : (dispatch_mode == 1) ? "preprocess_fast"
+                             : "dispatch";
   int (*dispatch_fn)(const void *, void *, const int *, const DispatchConfig *) =
       dispatch_tokens;
   int *round_num = nullptr;
-  if (dispatch_mode != 0) {
+  if (dispatch_mode == 1 || dispatch_mode == 2) {
     cudaMalloc((void **)&round_num, (size_t)npes * sizeof(int));
     if (!round_num) {
       cudaFree(cfg.counts);
@@ -152,18 +177,27 @@ int main(int argc, char **argv) {
       cudaFree(cfg.local_counts);
       cudaFree(cfg.barrier_counter);
       cudaFree(cfg.barrier_sense);
+      if (cfg.node_counts) cudaFree(cfg.node_counts);
+      if (cfg.src_forward_local) cudaFree(cfg.src_forward_local);
+      if (cfg.src_local_of_forward) cudaFree(cfg.src_local_of_forward);
+      if (cfg.dst_forward_local) cudaFree(cfg.dst_forward_local);
+      if (cfg.src_forward_local_of_dst_forward) cudaFree(cfg.src_forward_local_of_dst_forward);
       free_buffers(&buf);
       nvshmem_finalize();
       return 1;
     }
   }
-  if (dispatch_mode != 0) {
+  if (dispatch_mode == 3) {
+    status = pre_process_balance(buf.routing_map, buf.intranode_index, &cfg);
+  } else if (dispatch_mode != 0) {
     status = pre_process_fast(buf.routing_map, buf.intranode_index, round_num, &cfg);
   } else {
     status = pre_process(buf.routing_map, buf.intranode_index, &cfg);
   }
   if (status == 0) {
-    if (dispatch_mode == 2) {
+    if (dispatch_mode == 3) {
+      status = dispatch_tokens_balance(buf.input_tokens, buf.output_tokens, buf.intranode_index, &cfg);
+    } else if (dispatch_mode == 2) {
       status = dispatch_tokens_fast(buf.input_tokens, buf.output_tokens, buf.intranode_index,
                                     round_num, &cfg);
     } else {
@@ -180,7 +214,9 @@ int main(int argc, char **argv) {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     for (int i = 0; i < bench_warmup; ++i) {
-      if (dispatch_mode == 2) {
+      if (dispatch_mode == 3) {
+        dispatch_tokens_balance(buf.input_tokens, buf.output_tokens, buf.intranode_index, &cfg);
+      } else if (dispatch_mode == 2) {
         dispatch_tokens_fast(buf.input_tokens, buf.output_tokens, buf.intranode_index, round_num,
                              &cfg);
       } else {
@@ -190,7 +226,9 @@ int main(int argc, char **argv) {
     }
     cudaEventRecord(start);
     for (int i = 0; i < bench_iters; ++i) {
-      if (dispatch_mode == 2) {
+      if (dispatch_mode == 3) {
+        dispatch_tokens_balance(buf.input_tokens, buf.output_tokens, buf.intranode_index, &cfg);
+      } else if (dispatch_mode == 2) {
         dispatch_tokens_fast(buf.input_tokens, buf.output_tokens, buf.intranode_index, round_num,
                              &cfg);
       } else {
@@ -226,6 +264,11 @@ int main(int argc, char **argv) {
   cudaFree(cfg.local_counts);
   cudaFree(cfg.barrier_counter);
   cudaFree(cfg.barrier_sense);
+  if (cfg.node_counts) cudaFree(cfg.node_counts);
+  if (cfg.src_forward_local) cudaFree(cfg.src_forward_local);
+  if (cfg.src_local_of_forward) cudaFree(cfg.src_local_of_forward);
+  if (cfg.dst_forward_local) cudaFree(cfg.dst_forward_local);
+  if (cfg.src_forward_local_of_dst_forward) cudaFree(cfg.src_forward_local_of_dst_forward);
   if (round_num) cudaFree(round_num);
   free_buffers(&buf);
   nvshmem_finalize();

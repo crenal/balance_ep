@@ -36,6 +36,7 @@ target_include_directories(balance_ep_headers INTERFACE ${CMAKE_CURRENT_SOURCE_D
 add_library(balance_ep_core
   src/dispatch.cu
   src/dispatch_fast.cu
+  src/dispatch_balance.cu
 )
 target_link_libraries(balance_ep_core PUBLIC
   balance_ep_headers

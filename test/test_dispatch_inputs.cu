@@ -208,6 +208,9 @@ void init_inputs(TestBuffers *buf, int num_tokens_per_rank, int hidden_size, int
   }
   cudaMemcpy(buf->input_tokens, buf->input_h, input_bytes, cudaMemcpyHostToDevice);
   cudaMemset(buf->output_tokens, 0, output_bytes);
+  if (buf->local_buf && buf->local_buf_bytes > 0) {
+    cudaMemset(buf->local_buf, 0, buf->local_buf_bytes);
+  }
   if (buf->mid_buf && buf->mid_buf_bytes > 0) {
     cudaMemset(buf->mid_buf, 0, buf->mid_buf_bytes);
   }

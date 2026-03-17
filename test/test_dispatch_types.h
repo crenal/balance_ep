@@ -8,8 +8,10 @@ struct TestBuffers {
   float *output_tokens;
   bool *routing_map;
   int *intranode_index;
+  void *local_buf;
   void *mid_buf;
   uint64_t *mid_flags;
+  size_t local_buf_bytes;
   size_t mid_buf_bytes;
   size_t mid_flags_bytes;
   float *input_h;
