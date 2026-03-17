@@ -37,6 +37,9 @@ add_library(balance_ep_core
   src/dispatch.cu
   src/dispatch_fast.cu
   src/dispatch_balance.cu
+  src/combine.cu
+  src/combine_fast.cu
+  src/combine_balance.cu
 )
 target_link_libraries(balance_ep_core PUBLIC
   balance_ep_headers
@@ -62,6 +65,21 @@ target_link_libraries(test_dispatch PRIVATE
   balance_ep_core
 )
 set_target_properties(test_dispatch PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  BUILD_RPATH "${NVSHMEM_ROOT}/lib"
+  INSTALL_RPATH "${NVSHMEM_ROOT}/lib"
+)
+
+add_executable(test_combine
+  test/test_combine.cu
+  test/test_dispatch_buffers.cu
+  test/test_dispatch_env.cu
+  test/test_dispatch_inputs.cu
+)
+target_link_libraries(test_combine PRIVATE
+  balance_ep_core
+)
+set_target_properties(test_combine PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
   BUILD_RPATH "${NVSHMEM_ROOT}/lib"
   INSTALL_RPATH "${NVSHMEM_ROOT}/lib"

@@ -59,3 +59,12 @@ int pre_process_balance(const bool *routing_map, int *dst_index, const DispatchC
 
 int dispatch_tokens_balance(const void *input_tokens, void *output_tokens, const int *dst_index,
                             const DispatchConfig *cfg);
+
+int combine_tokens(const void *input_tokens, void *output_tokens, const int *intranode_index,
+                   const DispatchConfig *cfg);
+
+int combine_tokens_fast(const void *input_tokens, void *output_tokens, const int *dst_index,
+                        const int *round_num, const DispatchConfig *cfg);
+
+int combine_tokens_balance(const void *input_tokens, void *output_tokens, const int *dst_index,
+                           const DispatchConfig *cfg);
